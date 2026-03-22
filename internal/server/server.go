@@ -985,6 +985,15 @@ func (s *Server) handleAddProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for duplicate hostname
+	for _, p := range s.providers {
+		if config.SameHost(p.BaseURL, baseURL) {
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprintf(w, `<div class="result-error">与已有站点 "%s" 重复（相同域名）</div>`, p.Name)
+			return
+		}
+	}
+
 	// Validate connectivity
 	_, err := s.engine.FetchModels(r.Context(), baseURL, apiKey)
 

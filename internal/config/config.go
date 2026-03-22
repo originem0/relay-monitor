@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"time"
 
@@ -73,7 +74,7 @@ func LoadConfig(path string) (*AppConfig, error) {
 	return cfg, nil
 }
 
-// LoadProviders reads providers from a JSON file.
+// LoadProviders reads providers from a JSON file, deduplicating by hostname.
 // Returns an empty slice (not nil) if the file doesn't exist.
 func LoadProviders(path string) ([]provider.Provider, error) {
 	data, err := os.ReadFile(path)
@@ -84,11 +85,50 @@ func LoadProviders(path string) ([]provider.Provider, error) {
 		return nil, fmt.Errorf("read providers: %w", err)
 	}
 
-	var providers []provider.Provider
-	if err := json.Unmarshal(data, &providers); err != nil {
+	var raw []provider.Provider
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse providers: %w", err)
 	}
+
+	// Deduplicate by hostname
+	seen := make(map[string]int) // hostname -> index in result
+	var providers []provider.Provider
+	changed := false
+	for _, p := range raw {
+		host := extractHost(p.BaseURL)
+		if idx, exists := seen[host]; exists {
+			// Merge: keep existing, absorb missing fields from duplicate
+			changed = true
+			if p.AccessToken != "" && providers[idx].AccessToken == "" {
+				providers[idx].AccessToken = p.AccessToken
+			}
+			if p.LastKnownQuota > 0 && providers[idx].LastKnownQuota == 0 {
+				providers[idx].LastKnownQuota = p.LastKnownQuota
+			}
+			continue
+		}
+		seen[host] = len(providers)
+		providers = append(providers, p)
+	}
+
+	// Auto-save if duplicates were removed
+	if changed {
+		SaveProviders(path, providers)
+	}
 	return providers, nil
+}
+
+func extractHost(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return baseURL
+	}
+	return u.Hostname()
+}
+
+// SameHost checks if two base URLs point to the same hostname.
+func SameHost(a, b string) bool {
+	return extractHost(a) == extractHost(b)
 }
 
 // SaveProviders writes providers to a JSON file with readable formatting.
