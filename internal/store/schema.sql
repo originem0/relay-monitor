@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS providers (
     status      TEXT DEFAULT 'unknown',
     health      REAL DEFAULT 0,
     last_balance REAL,
+    last_error  TEXT DEFAULT '',
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );

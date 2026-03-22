@@ -51,6 +51,7 @@ type ProviderCard struct {
 	Balance      *float64
 	Pinned       bool
 	Note         string
+	ErrorMsg     string
 }
 
 // EventItem is the view model for an event in the list.
@@ -356,10 +357,12 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 			}
 			health = ratio * 100
 		}
+		errMsg := ""
 		if pr.Error != "" && len(pr.Results) == 0 {
 			status = "error"
+			errMsg = pr.Error
 		}
-		s.store.UpdateProviderStatus(pid, status, health)
+		s.store.UpdateProviderStatus(pid, status, health, errMsg)
 
 		// Push per-provider SSE update so dashboard refreshes incrementally
 		s.sseHub.Publish(SSEEvent{Type: "provider_done", Data: pr.Provider})
@@ -437,6 +440,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			Platform: dp.Platform,
 			Health:   int(dp.Health),
 			Balance:  dp.LastBalance,
+			ErrorMsg: dp.LastError,
 		}
 		if meta, ok := provMeta[dp.Name]; ok {
 			card.Pinned = meta.Pinned
@@ -790,10 +794,12 @@ func (s *Server) handleTriggerSingleCheck(w http.ResponseWriter, r *http.Request
 			}
 			health = ratio * 100
 		}
+		errMsg := ""
 		if pr.Error != "" && len(pr.Results) == 0 {
 			status = "error"
+			errMsg = pr.Error
 		}
-		s.store.UpdateProviderStatus(pid, status, health)
+		s.store.UpdateProviderStatus(pid, status, health, errMsg)
 		s.store.FinishCheckRun(runID, 1, len(pr.Results), 0, correct,
 			fmt.Sprintf("%s: %d models, %d correct", target.Name, len(pr.Results), correct))
 

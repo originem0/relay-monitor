@@ -35,6 +35,9 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
 
+	// Add last_error column if missing (migration)
+	db.Exec(`ALTER TABLE providers ADD COLUMN last_error TEXT DEFAULT ''`)
+
 	return &Store{db: db}, nil
 }
 

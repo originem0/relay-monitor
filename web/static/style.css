@@ -295,6 +295,16 @@ tr.row-untested td { opacity: 0.5; }
     max-width: 100%;
 }
 
+.provider-error {
+    font-size: 0.78rem;
+    color: var(--down);
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+}
+
 /* Events */
 .section-header {
     font-size: 1.1rem;

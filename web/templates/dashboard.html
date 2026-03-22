@@ -10,6 +10,7 @@
             {{if and .Platform (ne .Platform "unknown")}}<span class="platform-tag">{{.Platform}}</span>{{end}}
         </div>
         {{if .Note}}<div class="provider-note">{{.Note}}</div>{{end}}
+        {{if .ErrorMsg}}<div class="provider-error">{{.ErrorMsg}}</div>{{end}}
         <div class="provider-stats">
             <span><span class="stat-value">{{.ModelsOK}}/{{.ModelsTotal}}</span> 正确</span>
             <span>延迟 <span class="stat-value">{{if .AvgLatencyMs}}{{printf "%.1f" .AvgLatencyMs}}s{{else}}-{{end}}</span></span>

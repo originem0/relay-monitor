@@ -16,6 +16,7 @@ type ProviderRow struct {
 	Status      string
 	Health      float64
 	LastBalance *float64 // nil = not supported
+	LastError   string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -80,14 +81,14 @@ func (s *Store) UpsertProvider(name, baseURL, apiFormat, platform string) (int64
 	return id, nil
 }
 
-func (s *Store) UpdateProviderStatus(id int64, status string, health float64) error {
-	_, err := s.db.Exec(`UPDATE providers SET status = ?, health = ?, updated_at = datetime('now') WHERE id = ?`,
-		status, health, id)
+func (s *Store) UpdateProviderStatus(id int64, status string, health float64, lastError string) error {
+	_, err := s.db.Exec(`UPDATE providers SET status = ?, health = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?`,
+		status, health, lastError, id)
 	return err
 }
 
 func (s *Store) GetProviders() ([]ProviderRow, error) {
-	rows, err := s.db.Query(`SELECT id, name, base_url, api_format, platform, status, health, last_balance, created_at, updated_at FROM providers ORDER BY health DESC, name`)
+	rows, err := s.db.Query(`SELECT id, name, base_url, api_format, platform, status, health, last_balance, COALESCE(last_error,''), created_at, updated_at FROM providers ORDER BY health DESC, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +98,7 @@ func (s *Store) GetProviders() ([]ProviderRow, error) {
 	for rows.Next() {
 		var r ProviderRow
 		var balance sql.NullFloat64
-		err := rows.Scan(&r.ID, &r.Name, &r.BaseURL, &r.APIFormat, &r.Platform, &r.Status, &r.Health, &balance, &r.CreatedAt, &r.UpdatedAt)
+		err := rows.Scan(&r.ID, &r.Name, &r.BaseURL, &r.APIFormat, &r.Platform, &r.Status, &r.Health, &balance, &r.LastError, &r.CreatedAt, &r.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}
