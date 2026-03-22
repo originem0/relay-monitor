@@ -760,55 +760,54 @@ func (s *Server) handleTriggerSingleCheck(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Single-provider check runs independently, not blocked by global isChecking
-	s.sseHub.Publish(SSEEvent{Type: "provider_done", Data: target.Name + " 检测中..."})
+	// Run synchronously — single provider is fast enough
+	pid, _ := s.store.UpsertProvider(target.Name, target.BaseURL, target.APIFormat, target.Platform)
+	pr := s.engine.TestProvider(r.Context(), *target, checker.ModeFull, func(msg string) {
+		log.Printf("[manual] [%s] %s", time.Now().Format("15:04:05"), msg)
+	})
 
-	go func() {
-		pid, _ := s.store.UpsertProvider(target.Name, target.BaseURL, target.APIFormat, target.Platform)
-		pr := s.engine.TestProvider(context.Background(), *target, checker.ModeFull, func(msg string) {
-			log.Printf("[manual] [%s] %s", time.Now().Format("15:04:05"), msg)
-		})
+	// Store results
+	runID := fmt.Sprintf("manual-%d", time.Now().UnixNano())
+	s.store.InsertCheckRun(runID, "basic", "manual")
+	for _, tr := range pr.Results {
+		s.store.InsertCheckResult(runID, pid, tr.Model, tr.Vendor, tr.Status,
+			tr.Correct, tr.Answer, tr.LatencyMs, tr.Error, tr.HasReasoning)
+	}
 
-		// Store results
-		runID := fmt.Sprintf("manual-%d", time.Now().UnixNano())
-		s.store.InsertCheckRun(runID, "basic", "manual")
-		for _, r := range pr.Results {
-			s.store.InsertCheckResult(runID, pid, r.Model, r.Vendor, r.Status,
-				r.Correct, r.Answer, r.LatencyMs, r.Error, r.HasReasoning)
+	correct := 0
+	for _, tr := range pr.Results {
+		if tr.Correct {
+			correct++
 		}
-
-		// Update provider status
-		correct := 0
-		for _, r := range pr.Results {
-			if r.Correct {
-				correct++
-			}
+	}
+	status, health := "down", 0.0
+	if len(pr.Results) > 0 {
+		ratio := float64(correct) / float64(len(pr.Results))
+		if ratio > 0.8 {
+			status = "ok"
+		} else if ratio > 0.5 {
+			status = "degraded"
 		}
-		status, health := "down", 0.0
-		if len(pr.Results) > 0 {
-			ratio := float64(correct) / float64(len(pr.Results))
-			if ratio > 0.8 {
-				status = "ok"
-			} else if ratio > 0.5 {
-				status = "degraded"
-			}
-			health = ratio * 100
-		}
-		errMsg := ""
-		if pr.Error != "" && len(pr.Results) == 0 {
-			status = "error"
-			errMsg = pr.Error
-		}
-		s.store.UpdateProviderStatus(pid, status, health, errMsg)
-		s.store.FinishCheckRun(runID, 1, len(pr.Results), 0, correct,
-			fmt.Sprintf("%s: %d models, %d correct", target.Name, len(pr.Results), correct))
+		health = ratio * 100
+	}
+	errMsg := ""
+	if pr.Error != "" && len(pr.Results) == 0 {
+		status = "error"
+		errMsg = pr.Error
+	}
+	s.store.UpdateProviderStatus(pid, status, health, errMsg)
+	s.store.FinishCheckRun(runID, 1, len(pr.Results), 0, correct,
+		fmt.Sprintf("%s: %d models, %d correct", target.Name, len(pr.Results), correct))
 
-		s.sseHub.Publish(SSEEvent{Type: "check_completed",
-			Data: fmt.Sprintf("%s 检测完成: %d/%d 正确", target.Name, correct, len(pr.Results))})
-	}()
-
-	w.WriteHeader(http.StatusAccepted)
-	fmt.Fprintf(w, `<span style="color:var(--accent)">%s 检测已启动，结果将自动刷新</span>`, name)
+	// Return result directly as HTML feedback
+	if errMsg != "" {
+		fmt.Fprintf(w, `<span style="color:var(--down)">%s: %s</span>`, name, errMsg)
+	} else if len(pr.Results) == 0 {
+		fmt.Fprintf(w, `<span style="color:var(--down)">%s: 无可用模型</span>`, name)
+	} else {
+		fmt.Fprintf(w, `<span style="color:var(--ok)">%s: %d/%d 正确 — <a href="/provider/%s" style="color:var(--accent)">查看详情</a></span>`,
+			name, correct, len(pr.Results), name)
+	}
 }
 
 func (s *Server) handleGetProviders(w http.ResponseWriter, r *http.Request) {
