@@ -18,16 +18,21 @@
         <input type="text" name="api_key" required placeholder="sk-xxx">
     </div>
     <div class="form-group">
-        <label>面板令牌 (可选, 用于余额查询)</label>
-        <input type="text" name="access_token" placeholder="eyJhbGc...">
+        <label>面板令牌 <span class="text-dim">(可选, 用于余额查询)</span></label>
+        <input type="text" name="access_token" placeholder="new-api 面板登录后获取的 access_token">
     </div>
-    <div class="form-group">
-        <label>API 格式</label>
-        <div style="display:flex;gap:16px">
-            <label><input type="radio" name="api_format" value="chat" checked> Chat Completions</label>
-            <label><input type="radio" name="api_format" value="responses"> Responses API</label>
+
+    <details style="margin-bottom:16px">
+        <summary class="text-dim" style="cursor:pointer;font-size:0.85rem">高级选项</summary>
+        <div class="form-group" style="margin-top:8px">
+            <label>API 格式 <span class="text-dim">(绝大部分站点选 Chat，无需修改)</span></label>
+            <div style="display:flex;gap:16px">
+                <label><input type="radio" name="api_format" value="chat" checked> Chat Completions <span class="text-dim">(Claude/GPT/国产模型通用)</span></label>
+                <label><input type="radio" name="api_format" value="responses"> Responses API <span class="text-dim">(仅纯 OpenAI 转发站)</span></label>
+            </div>
         </div>
-    </div>
+    </details>
+
     <button type="submit" class="btn btn-primary">验证并添加</button>
 </form>
 

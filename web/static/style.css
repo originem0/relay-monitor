@@ -274,6 +274,27 @@ tr.row-untested td { opacity: 0.5; }
     color: var(--text-dim);
 }
 
+.provider-card.pinned {
+    border-color: var(--degraded);
+    border-width: 2px;
+}
+
+.pin-icon {
+    color: var(--degraded);
+    font-size: 0.9rem;
+    flex-shrink: 0;
+}
+
+.provider-note {
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+}
+
 /* Events */
 .section-header {
     font-size: 1.1rem;

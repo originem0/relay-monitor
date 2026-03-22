@@ -14,7 +14,11 @@
             hx-swap="innerHTML">
         检测全部模型
     </button>
-    <span id="check-feedback"></span>
+    <button class="btn btn-sm"
+            hx-post="/api/v1/providers/{{.Provider.Name}}/pin"
+            hx-swap="none">
+        {{if .Provider.Pinned}}取消置顶{{else}}置顶{{end}}
+    </button>
     <button class="btn btn-sm btn-danger"
             hx-delete="/api/v1/providers/{{.Provider.Name}}"
             hx-confirm="确认删除 {{.Provider.Name}}?"
@@ -22,9 +26,48 @@
             hx-swap="innerHTML">
         删除
     </button>
+    <span id="check-feedback"></span>
 </div>
 
 <p class="text-dim mb-2">{{.Provider.URL}}</p>
+
+<!-- 备注 -->
+<div style="margin-bottom:16px;display:flex;align-items:center;gap:8px">
+    <form style="display:flex;gap:8px;align-items:center;flex:1;max-width:500px"
+          hx-post="/api/v1/providers/{{.Provider.Name}}/note" hx-swap="none">
+        <input type="text" name="note" value="{{.Provider.Note}}" placeholder="添加备注..." style="flex:1;padding:4px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:0.85rem">
+        <button type="submit" class="btn btn-sm">保存备注</button>
+    </form>
+</div>
+
+<!-- 编辑站点 -->
+<details style="margin-bottom:16px">
+    <summary class="text-dim" style="cursor:pointer;font-size:0.85rem">编辑站点信息</summary>
+    <form class="provider-form" style="margin-top:8px"
+          hx-post="/api/v1/providers/{{.Provider.Name}}/edit" hx-swap="none">
+        <div class="form-group">
+            <label>站名</label>
+            <input type="text" name="name" value="{{.Provider.Name}}">
+        </div>
+        <div class="form-group">
+            <label>Base URL</label>
+            <input type="text" name="base_url" value="{{.Provider.URL}}">
+        </div>
+        <div class="form-group">
+            <label>API Key</label>
+            <input type="text" name="api_key" value="{{.Provider.APIKey}}">
+        </div>
+        <div class="form-group">
+            <label>面板令牌 (余额查询)</label>
+            <input type="text" name="access_token" value="{{.Provider.AccessToken}}">
+        </div>
+        <div class="form-group">
+            <label>备注</label>
+            <input type="text" name="note" value="{{.Provider.Note}}">
+        </div>
+        <button type="submit" class="btn btn-primary btn-sm">保存修改</button>
+    </form>
+</details>
 
 <div class="table-wrap">
     <table>

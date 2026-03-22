@@ -49,6 +49,8 @@ type ProviderCard struct {
 	AvgLatencyMs float64
 	Health       int
 	Balance      *float64
+	Pinned       bool
+	Note         string
 }
 
 // EventItem is the view model for an event in the list.
@@ -107,10 +109,14 @@ type pageData struct {
 	Events    []EventItem
 	// Provider detail
 	Provider *struct {
-		Name   string
-		Status string
-		Health int
-		URL    string
+		Name     string
+		Status   string
+		Health   int
+		URL      string
+		Pinned   bool
+		Note     string
+		APIKey   string
+		AccessToken string
 	}
 	Models []ModelRow
 	// Models view
@@ -203,6 +209,9 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/v1/providers", s.handleGetProviders)
 	mux.HandleFunc("POST /api/v1/providers", s.handleAddProvider)
 	mux.HandleFunc("DELETE /api/v1/providers/{name}", s.handleDeleteProvider)
+	mux.HandleFunc("POST /api/v1/providers/{name}/pin", s.handleTogglePin)
+	mux.HandleFunc("POST /api/v1/providers/{name}/note", s.handleUpdateNote)
+	mux.HandleFunc("POST /api/v1/providers/{name}/edit", s.handleEditProvider)
 	mux.HandleFunc("GET /api/v1/status", s.handleGetStatus)
 	mux.HandleFunc("POST /api/v1/events/read", s.handleMarkEventsRead)
 	mux.HandleFunc("GET /api/v1/sse", s.sseHub.HandleSSE)
@@ -415,6 +424,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		provResults[cr.ProviderID] = append(provResults[cr.ProviderID], cr)
 	}
 
+	// Build pinned/note lookup from in-memory providers
+	provMeta := make(map[string]provider.Provider)
+	for _, p := range s.providers {
+		provMeta[p.Name] = p
+	}
+
 	for _, dp := range dbProviders {
 		card := ProviderCard{
 			Name:     dp.Name,
@@ -422,6 +437,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			Platform: dp.Platform,
 			Health:   int(dp.Health),
 			Balance:  dp.LastBalance,
+		}
+		if meta, ok := provMeta[dp.Name]; ok {
+			card.Pinned = meta.Pinned
+			card.Note = meta.Note
 		}
 		if results, ok := provResults[dp.ID]; ok {
 			card.ModelsTotal = len(results)
@@ -442,6 +461,14 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		data.Providers = append(data.Providers, card)
 	}
+
+	// Sort: pinned first, then by health descending
+	sort.Slice(data.Providers, func(i, j int) bool {
+		if data.Providers[i].Pinned != data.Providers[j].Pinned {
+			return data.Providers[i].Pinned
+		}
+		return data.Providers[i].Health > data.Providers[j].Health
+	})
 
 	// Events
 	events, _ := s.store.GetRecentEvents(20)
@@ -597,16 +624,27 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := s.basePageData(dp.Name)
+	provMeta := s.findProvider(dp.Name)
 	data.Provider = &struct {
-		Name   string
-		Status string
-		Health int
-		URL    string
+		Name     string
+		Status   string
+		Health   int
+		URL      string
+		Pinned   bool
+		Note     string
+		APIKey   string
+		AccessToken string
 	}{
 		Name:   dp.Name,
 		Status: dp.Status,
 		Health: int(dp.Health),
 		URL:    dp.BaseURL,
+	}
+	if provMeta != nil {
+		data.Provider.Pinned = provMeta.Pinned
+		data.Provider.Note = provMeta.Note
+		data.Provider.APIKey = provMeta.APIKey
+		data.Provider.AccessToken = provMeta.AccessToken
 	}
 
 	// Get stored test results for this provider
@@ -1046,5 +1084,80 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 
 	// Redirect to dashboard
 	w.Header().Set("HX-Redirect", "/")
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleTogglePin(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	s.mu.Lock()
+	for i, p := range s.providers {
+		if p.Name == name {
+			s.providers[i].Pinned = !s.providers[i].Pinned
+			break
+		}
+	}
+	provs := make([]provider.Provider, len(s.providers))
+	copy(provs, s.providers)
+	s.mu.Unlock()
+	config.SaveProviders(s.cfg.ProvidersFile, provs)
+	w.Header().Set("HX-Redirect", "/provider/"+name)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleUpdateNote(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	r.ParseForm()
+	note := r.FormValue("note")
+	s.mu.Lock()
+	for i, p := range s.providers {
+		if p.Name == name {
+			s.providers[i].Note = note
+			break
+		}
+	}
+	provs := make([]provider.Provider, len(s.providers))
+	copy(provs, s.providers)
+	s.mu.Unlock()
+	config.SaveProviders(s.cfg.ProvidersFile, provs)
+	w.Header().Set("HX-Redirect", "/provider/"+name)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	r.ParseForm()
+	newName := r.FormValue("name")
+	baseURL := r.FormValue("base_url")
+	apiKey := r.FormValue("api_key")
+	accessToken := r.FormValue("access_token")
+	note := r.FormValue("note")
+
+	s.mu.Lock()
+	for i, p := range s.providers {
+		if p.Name == name {
+			if newName != "" {
+				s.providers[i].Name = newName
+			}
+			if baseURL != "" {
+				s.providers[i].BaseURL = baseURL
+			}
+			if apiKey != "" {
+				s.providers[i].APIKey = apiKey
+			}
+			s.providers[i].AccessToken = accessToken
+			s.providers[i].Note = note
+			break
+		}
+	}
+	provs := make([]provider.Provider, len(s.providers))
+	copy(provs, s.providers)
+	s.mu.Unlock()
+	config.SaveProviders(s.cfg.ProvidersFile, provs)
+
+	redirect := "/provider/" + name
+	if newName != "" && newName != name {
+		redirect = "/provider/" + newName
+	}
+	w.Header().Set("HX-Redirect", redirect)
 	w.WriteHeader(http.StatusOK)
 }

@@ -12,6 +12,8 @@ type Provider struct {
 	APIFormat      string  `json:"api_format,omitempty"`
 	Platform       string  `json:"platform,omitempty"`
 	LastKnownQuota float64 `json:"last_known_quota,omitempty"`
+	Pinned         bool    `json:"pinned,omitempty"`
+	Note           string  `json:"note,omitempty"`
 }
 
 // vendorPattern maps a keyword (matched case-insensitively) to a vendor name.
