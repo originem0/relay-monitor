@@ -1,0 +1,35 @@
+{{template "layout.html" .}}
+{{define "content"}}
+<a href="/" class="back-link">&larr; 返回总览</a>
+
+<h2 style="margin-bottom:16px">添加站点</h2>
+
+<form id="add-form" class="provider-form" hx-post="/api/v1/providers" hx-target="#add-result" hx-swap="innerHTML">
+    <div class="form-group">
+        <label>站名</label>
+        <input type="text" name="name" required placeholder="My Provider">
+    </div>
+    <div class="form-group">
+        <label>Base URL</label>
+        <input type="text" name="base_url" required placeholder="https://example.com/v1">
+    </div>
+    <div class="form-group">
+        <label>API Key</label>
+        <input type="text" name="api_key" required placeholder="sk-xxx">
+    </div>
+    <div class="form-group">
+        <label>面板令牌 (可选, 用于余额查询)</label>
+        <input type="text" name="access_token" placeholder="eyJhbGc...">
+    </div>
+    <div class="form-group">
+        <label>API 格式</label>
+        <div style="display:flex;gap:16px">
+            <label><input type="radio" name="api_format" value="chat" checked> Chat Completions</label>
+            <label><input type="radio" name="api_format" value="responses"> Responses API</label>
+        </div>
+    </div>
+    <button type="submit" class="btn btn-primary">验证并添加</button>
+</form>
+
+<div id="add-result" style="margin-top:16px"></div>
+{{end}}

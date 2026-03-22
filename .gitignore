@@ -1,0 +1,10 @@
+relay-monitor.exe
+relay-monitor.db
+relay-monitor.db-wal
+relay-monitor.db-shm
+*.db
+*.db-wal
+*.db-shm
+/tmp/
+accounts-backup-*.json
+providers.json

@@ -1,0 +1,47 @@
+{{template "layout.html" .}}
+{{define "content"}}
+<div class="provider-grid">
+    {{range .Providers}}
+    <a href="/provider/{{.Name}}" class="provider-card">
+        <div class="provider-card-header">
+            <span class="status-dot status-{{.Status}}"></span>
+            <span class="provider-name">{{.Name}}</span>
+            {{if and .Platform (ne .Platform "unknown")}}<span class="platform-tag">{{.Platform}}</span>{{end}}
+        </div>
+        <div class="provider-stats">
+            <span><span class="stat-value">{{.ModelsOK}}/{{.ModelsTotal}}</span> 正确</span>
+            <span>延迟 <span class="stat-value">{{if .AvgLatencyMs}}{{printf "%.1f" .AvgLatencyMs}}s{{else}}-{{end}}</span></span>
+            {{if .Balance}}<span>余额 <span class="stat-value">${{printf "%.2f" (quota2usd (deref .Balance))}}</span></span>{{end}}
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+            <div class="health-badge {{if ge .Health 80}}health-good{{else if ge .Health 50}}health-warn{{else}}health-bad{{end}}">
+                {{.Health}}
+            </div>
+            <span class="health-label">健康分</span>
+        </div>
+    </a>
+    {{end}}
+</div>
+
+{{if .Events}}
+<div class="mt-2">
+    <div class="section-header" style="display:flex;justify-content:space-between;align-items:center">
+        最近变更
+        <button class="btn btn-sm" hx-post="/api/v1/events/read" hx-swap="none" onclick="this.closest('.mt-2').querySelectorAll('.unread').forEach(e=>e.classList.remove('unread'));this.style.display='none'">全部已读</button>
+    </div>
+    <ul class="event-list">
+        {{range .Events}}
+        <li class="event-item{{if not .Read}} unread{{end}}">
+            <span class="event-dot type-{{.Type}}"></span>
+            <span class="event-time">{{.CreatedAt}}</span>
+            <span class="event-msg">
+                {{if .Provider}}<strong>{{.Provider}}</strong> {{end}}
+                {{if .Model}}[{{.Model}}] {{end}}
+                {{.Message}}
+            </span>
+        </li>
+        {{end}}
+    </ul>
+</div>
+{{end}}
+{{end}}

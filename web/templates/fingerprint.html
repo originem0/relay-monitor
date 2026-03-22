@@ -1,0 +1,87 @@
+{{template "layout.html" .}}
+{{define "content"}}
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <h2>指纹鉴别</h2>
+    <button class="btn btn-primary" hx-post="/api/v1/fingerprint/trigger" hx-swap="none">运行指纹检测</button>
+</div>
+
+<details class="fingerprint-info" open>
+    <summary>检测原理</summary>
+    <div class="info-body">
+        <p>向每个模型发送 <strong>10 道分层数学/推理题</strong>，对比实际得分与该模型声称档次的期望最低分，判断模型是否被降级或替换。</p>
+
+        <div class="info-grid">
+            <div class="info-card">
+                <h4>题库分层</h4>
+                <table class="info-table">
+                    <tr><td class="level-tag l1">L1</td><td>门槛 (1题)</td><td>鸡兔同笼 → 126</td></tr>
+                    <tr><td class="level-tag l2">L2</td><td>算术陷阱 (3题)</td><td>多步运算、涨价打折、bat &amp; ball</td></tr>
+                    <tr><td class="level-tag l3">L3</td><td>推理梯度 (3题)</td><td>反直觉概率、代码追踪、蜗牛爬井</td></tr>
+                    <tr><td class="level-tag l4">L4</td><td>高阶计算 (3题)</td><td>质数求和、数字计数、幂运算</td></tr>
+                </table>
+            </div>
+            <div class="info-card">
+                <h4>判定逻辑</h4>
+                <table class="info-table">
+                    <tr><td class="verdict-badge verdict-genuine">GENUINE</td><td>得分 ≥ 期望值，模型可信</td></tr>
+                    <tr><td class="verdict-badge verdict-plausible">PLAUSIBLE</td><td>略低于期望，可能网络波动</td></tr>
+                    <tr><td class="verdict-badge verdict-suspected">SUSPECTED</td><td>明显低于期望，疑似降级</td></tr>
+                    <tr><td class="verdict-badge verdict-fake">LIKELY FAKE</td><td>得分远低于期望，大概率假冒</td></tr>
+                    <tr><td class="verdict-badge verdict-fail">FAIL</td><td>连 L1 门槛都过不了</td></tr>
+                    <tr><td class="verdict-badge verdict-mismatch">MISMATCH</td><td>自我认知与声称厂商不符</td></tr>
+                </table>
+            </div>
+            <div class="info-card">
+                <h4>档次期望 (满分 10)</h4>
+                <table class="info-table">
+                    <tr><td><strong>S 旗舰</strong></td><td>≥ 9 分</td><td>GPT-5.x, Claude 4.x, Gemini 3 Pro</td></tr>
+                    <tr><td><strong>A 强</strong></td><td>≥ 7 分</td><td>GPT-5, DeepSeek-V3, Kimi-K2</td></tr>
+                    <tr><td><strong>B 中等</strong></td><td>≥ 4 分</td><td>Qwen3-32B, Llama-3.3-70B</td></tr>
+                    <tr><td><strong>C 弱</strong></td><td>≥ 1 分</td><td>小模型、开源轻量模型</td></tr>
+                </table>
+            </div>
+        </div>
+
+        <p class="info-note">另外会发送一条「你是什么模型」的自我认知探针，检查模型是否声称了与模型名不一致的身份。</p>
+    </div>
+</details>
+
+{{if .Fingerprints}}
+<div class="table-wrap" style="margin-top:16px">
+    <table>
+        <thead>
+            <tr>
+                <th>站点</th>
+                <th>模型</th>
+                <th>L1</th>
+                <th>L2</th>
+                <th>L3</th>
+                <th>L4</th>
+                <th>总分</th>
+                <th>期望</th>
+                <th>判定</th>
+                <th>自我认知</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Fingerprints}}
+            <tr>
+                <td>{{.ProviderName}}</td>
+                <td>{{.Model}}</td>
+                <td>{{.L1}}</td>
+                <td>{{.L2}}</td>
+                <td>{{.L3}}</td>
+                <td>{{.L4}}</td>
+                <td><strong>{{.TotalScore}}</strong></td>
+                <td>{{.ExpectedTier}} (≥{{.ExpectedMin}})</td>
+                <td><span class="verdict-badge {{.VerdictClass}}">{{.Verdict}}</span></td>
+                <td title="{{.SelfIDDetail}}">{{.SelfIDVerdict}}</td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+</div>
+{{else}}
+<p style="color:var(--text-dim);text-align:center;padding:48px 0">尚无指纹检测结果。点击上方按钮运行检测。</p>
+{{end}}
+{{end}}

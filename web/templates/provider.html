@@ -1,0 +1,55 @@
+{{template "layout.html" .}}
+{{define "content"}}
+<a href="/" class="back-link">&larr; 返回总览</a>
+
+<div class="provider-header">
+    <h1>{{.Provider.Name}}</h1>
+    <span class="status-badge status-{{.Provider.Status}}">{{.Provider.Status}}</span>
+    <div class="health-badge {{if ge .Provider.Health 80}}health-good{{else if ge .Provider.Health 50}}health-warn{{else}}health-bad{{end}}">
+        {{.Provider.Health}}
+    </div>
+    <button class="btn btn-sm"
+            hx-post="/api/v1/check/trigger/{{.Provider.Name}}"
+            hx-target="#check-feedback"
+            hx-swap="innerHTML">
+        检测全部模型
+    </button>
+    <span id="check-feedback"></span>
+    <button class="btn btn-sm btn-danger"
+            hx-delete="/api/v1/providers/{{.Provider.Name}}"
+            hx-confirm="确认删除 {{.Provider.Name}}?"
+            hx-target="body"
+            hx-swap="innerHTML">
+        删除
+    </button>
+</div>
+
+<p class="text-dim mb-2">{{.Provider.URL}}</p>
+
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th></th>
+                <th>模型</th>
+                <th>厂商</th>
+                <th>延迟</th>
+                <th>结果</th>
+                <th>错误</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Models}}
+            <tr class="{{if eq .Status "ok"}}{{if .Correct}}row-ok{{else}}row-wrong{{end}}{{else if eq .Status "untested"}}row-untested{{else}}row-error{{end}}">
+                <td><span class="status-dot {{if eq .Status "ok"}}{{if .Correct}}status-ok{{else}}status-degraded{{end}}{{else if eq .Status "untested"}}status-unknown{{else}}status-down{{end}}"></span></td>
+                <td>{{.Model}}</td>
+                <td class="text-dim">{{.Vendor}}</td>
+                <td>{{if .LatencyMs}}{{printf "%.1f" (divf .LatencyMs 1000.0)}}s{{else}}-{{end}}</td>
+                <td>{{if eq .Status "untested"}}<span class="text-dim">未测试</span>{{else if eq .Status "ok"}}{{if .Correct}}<span class="text-ok">正确</span>{{else}}<span class="text-warn">错误答案</span>{{end}}{{else}}<span class="text-err">失败</span>{{end}}</td>
+                <td>{{if .Error}}<span class="model-error">{{.Error}}</span>{{end}}</td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+</div>
+{{end}}

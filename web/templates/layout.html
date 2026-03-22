@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{.Title}} - Relay Monitor</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F4E1;</text></svg>">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+    <nav class="navbar">
+        <span class="navbar-brand">Relay Monitor</span>
+        <div class="navbar-links">
+            <a href="/">总览</a>
+            <a href="/models">模型视图</a>
+            <a href="/fingerprint">指纹鉴别</a>
+        </div>
+        <div class="navbar-right">
+            <a href="/provider/add" class="btn btn-sm btn-primary">+ 添加站点</a>
+        </div>
+    </nav>
+
+    <div class="status-bar">
+        <div class="last-check">
+            {{if .IsChecking}}
+                <span class="htmx-indicator" style="opacity:1">检测中...</span>
+            {{else}}
+                上次检测: {{if .LastCheckTime}}{{.LastCheckTime}}{{else}}尚未检测{{end}}
+            {{end}}
+        </div>
+        <button class="btn btn-sm btn-primary"
+                hx-post="/api/v1/check/trigger?mode=full"
+                hx-swap="none">
+            全量检测
+        </button>
+        <button class="btn btn-sm"
+                hx-post="/api/v1/check/trigger?mode=quick"
+                hx-swap="none">
+            快速检测
+        </button>
+        {{if gt .UnreadEvents 0}}
+            <span class="unread-badge">{{.UnreadEvents}} 条未读变更</span>
+        {{end}}
+    </div>
+
+    <div class="main">
+        {{block "content" .}}{{end}}
+    </div>
+
+<script>
+(function() {
+    var es = new EventSource('/api/v1/sse');
+    var reloadTimer = null;
+
+    // 巡检全部完成后刷新一次，不再逐事件刷新
+    es.addEventListener('check_completed', function() {
+        if (reloadTimer) clearTimeout(reloadTimer);
+        reloadTimer = setTimeout(function() { location.reload(); }, 500);
+    });
+
+    // provider 完成时更新状态栏提示，不刷新整页
+    es.addEventListener('provider_done', function(e) {
+        var bar = document.querySelector('.last-check');
+        if (bar) bar.innerHTML = '<span style="opacity:0.7">检测中... ' + e.data + ' 完成</span>';
+    });
+
+    es.onerror = function() {
+        es.close();
+        setTimeout(function() { es = new EventSource('/api/v1/sse'); }, 5000);
+    };
+})();
+</script>
+</body>
+</html>

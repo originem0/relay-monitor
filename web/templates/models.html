@@ -1,0 +1,182 @@
+{{template "layout.html" .}}
+{{define "content"}}
+<div class="models-toolbar">
+    <div class="filter-group">
+        <label>厂商</label>
+        <select id="filter-vendor" onchange="filterModels()">
+            <option value="">全部</option>
+            {{range .Vendors}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+    </div>
+    <div class="filter-group">
+        <label>兼容性</label>
+        <select id="filter-compat" onchange="filterModels()">
+            <option value="">全部</option>
+            <option value="cc">Claude Code 兼容</option>
+        </select>
+    </div>
+    <div class="filter-group">
+        <label>排序</label>
+        <select id="sort-by" onchange="filterModels()">
+            <option value="providers">可用站数</option>
+            <option value="latency">最低延迟</option>
+            <option value="name">名称</option>
+        </select>
+    </div>
+</div>
+
+<div class="table-wrap">
+    <table class="models-table" id="models-table">
+        <thead>
+            <tr>
+                <th style="width:30px"></th>
+                <th>模型</th>
+                <th>厂商</th>
+                <th>可用站</th>
+                <th>最佳站点</th>
+                <th>延迟</th>
+                <th>CC兼容</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .ModelGroups}}
+            <tr class="model-row" data-vendor="{{.Vendor}}" data-compat="{{if .CCCompat}}cc{{end}}" data-providers="{{.AvailableCount}}" data-latency="{{.BestLatencyMs}}" data-name="{{.Model}}">
+                <td>
+                    <span class="expand-toggle" onclick="toggleExpand(this)">&#9654;</span>
+                </td>
+                <td class="model-name">{{.Model}}</td>
+                <td class="text-dim">{{.Vendor}}</td>
+                <td>{{.AvailableCount}}/{{.TotalCount}}</td>
+                <td>{{.BestProvider}}</td>
+                <td>{{if .BestLatencyMs}}{{printf "%.1f" (divf .BestLatencyMs 1000.0)}}s{{else}}-{{end}}</td>
+                <td>{{if .CCCompat}}<span class="text-ok">&#10003;</span>{{else}}<span class="text-dim">-</span>{{end}}</td>
+            </tr>
+            <tr class="model-detail" style="display:none">
+                <td></td>
+                <td colspan="6">
+                    <div class="detail-box">
+                        <table class="detail-table">
+                            <thead>
+                                <tr>
+                                    <th></th>
+                                    <th>站点</th>
+                                    <th>延迟</th>
+                                    <th>正确</th>
+                                    <th>指纹</th>
+                                    <th>tool_use</th>
+                                    <th>stream</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {{range .Providers}}
+                                <tr>
+                                    <td>{{if .IsBest}}<span class="best-star">&#9733;</span>{{end}}</td>
+                                    <td>{{.ProviderName}}</td>
+                                    <td>{{if .LatencyMs}}{{printf "%.1f" (divf .LatencyMs 1000.0)}}s{{else}}-{{end}}</td>
+                                    <td>{{if .Correct}}<span class="text-ok">&#10003;</span>{{else}}<span class="text-err">&#10007;</span>{{end}}</td>
+                                    <td>{{if .Verdict}}<span class="verdict-{{.VerdictClass}}">{{.Verdict}}</span>{{else}}<span class="text-dim">-</span>{{end}}</td>
+                                    <td>{{if eq .ToolUse "true"}}<span class="text-ok">&#10003;</span>{{else if eq .ToolUse "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
+                                    <td>{{if eq .Streaming "true"}}<span class="text-ok">&#10003;</span>{{else if eq .Streaming "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
+                                    <td>
+                                        <button class="btn btn-sm" onclick="showConfig('{{.ProviderName}}', '{{.BaseURL}}', '{{.Model}}')">配置</button>
+                                    </td>
+                                </tr>
+                                {{end}}
+                            </tbody>
+                        </table>
+                    </div>
+                </td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+</div>
+
+<!-- Config modal -->
+<div id="config-modal" class="modal" style="display:none" onclick="if(event.target===this)this.style.display='none'">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 id="config-title">配置片段</h3>
+            <button class="modal-close" onclick="document.getElementById('config-modal').style.display='none'">&times;</button>
+        </div>
+        <div id="config-body"></div>
+    </div>
+</div>
+
+<script>
+function toggleExpand(el) {
+    var row = el.closest('tr');
+    var detail = row.nextElementSibling;
+    if (detail.style.display === 'none') {
+        detail.style.display = '';
+        el.innerHTML = '&#9660;';
+    } else {
+        detail.style.display = 'none';
+        el.innerHTML = '&#9654;';
+    }
+}
+
+function filterModels() {
+    var vendor = document.getElementById('filter-vendor').value;
+    var compat = document.getElementById('filter-compat').value;
+    var rows = document.querySelectorAll('.model-row');
+    rows.forEach(function(r) {
+        var show = true;
+        if (vendor && r.dataset.vendor !== vendor) show = false;
+        if (compat && !r.dataset.compat) show = false;
+        r.style.display = show ? '' : 'none';
+        r.nextElementSibling.style.display = 'none';
+    });
+}
+
+function showConfig(provider, baseURL, model) {
+    var modal = document.getElementById('config-modal');
+    var title = document.getElementById('config-title');
+    var body = document.getElementById('config-body');
+    title.textContent = provider + ' / ' + model;
+
+    var configs = [
+        {
+            name: 'Claude Code (~/.claude/settings.json)',
+            text: JSON.stringify({
+                "apiProvider": "openai-compatible",
+                "apiBaseUrl": baseURL,
+                "model": model
+            }, null, 2)
+        },
+        {
+            name: 'OpenCode (opencode.json)',
+            text: '{\n  "providers": {\n    "relay": {\n      "apiKey": "sk-xxx",\n      "baseURL": "' + baseURL + '/"\n    }\n  },\n  "models": {\n    "default": "relay/' + model + '"\n  }\n}'
+        },
+        {
+            name: 'Cursor Settings',
+            text: 'openai.apiBaseUrl = "' + baseURL + '"'
+        }
+    ];
+
+    var html = '';
+    configs.forEach(function(c) {
+        html += '<div class="config-section">';
+        html += '<div class="config-label">' + c.name + '</div>';
+        html += '<div class="config-block"><pre>' + escapeHtml(c.text) + '</pre>';
+        html += '<button class="btn btn-sm config-copy" onclick="copyText(this)">复制</button>';
+        html += '</div></div>';
+    });
+    body.innerHTML = html;
+    modal.style.display = 'flex';
+}
+
+function copyText(btn) {
+    var pre = btn.previousElementSibling;
+    navigator.clipboard.writeText(pre.textContent).then(function() {
+        btn.textContent = '已复制';
+        setTimeout(function() { btn.textContent = '复制'; }, 1500);
+    });
+}
+
+function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+{{end}}

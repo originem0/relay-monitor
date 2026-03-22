@@ -1,0 +1,17 @@
+<a href="/provider/{{.Name}}" class="provider-card">
+    <div class="provider-card-header">
+        <span class="status-dot status-{{.Status}}"></span>
+        <span class="provider-name">{{.Name}}</span>
+        {{if .Platform}}<span class="platform-tag">{{.Platform}}</span>{{end}}
+    </div>
+    <div class="provider-stats">
+        <span><span class="stat-value">{{.ModelsOK}}/{{.ModelsTotal}}</span> 正确</span>
+        <span>avg <span class="stat-value">{{printf "%.1f" .AvgLatencyMs}}s</span></span>
+        <span>余额 <span class="stat-value">{{if .Balance}}{{printf "%.2f" (deref .Balance)}}{{else}}---{{end}}</span></span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+        <div class="health-badge {{if ge .Health 80}}health-good{{else if ge .Health 50}}health-warn{{else}}health-bad{{end}}">
+            {{.Health}}
+        </div>
+    </div>
+</a>

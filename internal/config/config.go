@@ -1,0 +1,101 @@
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/BurntSushi/toml"
+
+	"relay-monitor/internal/provider"
+)
+
+// Duration wraps time.Duration for TOML string parsing ("30m", "4s", etc.).
+type Duration struct {
+	time.Duration
+}
+
+func (d *Duration) UnmarshalText(text []byte) error {
+	var err error
+	d.Duration, err = time.ParseDuration(string(text))
+	return err
+}
+
+func (d Duration) MarshalText() ([]byte, error) {
+	return []byte(d.Duration.String()), nil
+}
+
+// AppConfig holds all application settings.
+type AppConfig struct {
+	Listen           string  `toml:"listen"`
+	CheckInterval    Duration `toml:"check_interval"`
+	RetentionDays    int     `toml:"retention_days"`
+	MaxConcurrency   int     `toml:"max_concurrency"`
+	RequestInterval  Duration `toml:"request_interval"`
+	SSLVerify        bool    `toml:"ssl_verify"`
+	DataDir          string  `toml:"data_dir"`
+	BalanceThreshold float64 `toml:"balance_threshold"`
+	ProvidersFile    string  `toml:"providers_file"`
+}
+
+// DefaultConfig returns an AppConfig with sensible defaults.
+func DefaultConfig() *AppConfig {
+	return &AppConfig{
+		Listen:           ":8080",
+		CheckInterval:    Duration{8 * time.Hour},
+		RetentionDays:    7,
+		MaxConcurrency:   16,
+		RequestInterval:  Duration{2 * time.Second},
+		SSLVerify:        false,
+		DataDir:          ".",
+		BalanceThreshold: 5.0,
+		ProvidersFile:    "providers.json",
+	}
+}
+
+// LoadConfig reads a TOML config file. Missing fields keep their defaults.
+// If the file doesn't exist, returns DefaultConfig.
+func LoadConfig(path string) (*AppConfig, error) {
+	cfg := DefaultConfig()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	return cfg, nil
+}
+
+// LoadProviders reads providers from a JSON file.
+// Returns an empty slice (not nil) if the file doesn't exist.
+func LoadProviders(path string) ([]provider.Provider, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []provider.Provider{}, nil
+		}
+		return nil, fmt.Errorf("read providers: %w", err)
+	}
+
+	var providers []provider.Provider
+	if err := json.Unmarshal(data, &providers); err != nil {
+		return nil, fmt.Errorf("parse providers: %w", err)
+	}
+	return providers, nil
+}
+
+// SaveProviders writes providers to a JSON file with readable formatting.
+func SaveProviders(path string, providers []provider.Provider) error {
+	data, err := json.MarshalIndent(providers, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal providers: %w", err)
+	}
+	return os.WriteFile(path, append(data, '\n'), 0644)
+}
