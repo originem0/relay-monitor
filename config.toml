@@ -1,17 +1,18 @@
 # Relay Monitor 配置
-listen = ":8080"
+listen = "127.0.0.1:8090"
 check_interval = "8h"
 retention_days = 7
 max_concurrency = 16
 request_interval = "2s"
-ssl_verify = false
-data_dir = "."
+ssl_verify = true
+data_dir = "./data"
 balance_threshold = 5.0
 providers_file = "providers.json"
+external_url = "https://relay.sharonzhou.site"
 
 [proxy]
 enabled = true
-api_key = "sk-relay-zhou"
+api_key = ""
 request_timeout = "30s"
 stream_first_byte_timeout = "30s"
 stream_idle_timeout = "60s"

@@ -48,6 +48,7 @@ type AppConfig struct {
 	DataDir          string      `toml:"data_dir"`
 	BalanceThreshold float64     `toml:"balance_threshold"`
 	ProvidersFile    string      `toml:"providers_file"`
+	ExternalURL      string      `toml:"external_url"`
 	Proxy            ProxyConfig `toml:"proxy"`
 }
 

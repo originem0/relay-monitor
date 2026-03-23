@@ -7,15 +7,14 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F4E1;</text></svg>">
     <link rel="stylesheet" href="/static/style.css">
     <script src="/static/htmx.min.js"></script>
-    <style>.task-panel{background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin:0 auto 0;max-width:1200px;}</style>
 </head>
 <body>
     <nav class="navbar">
-        <span class="navbar-brand">Relay Monitor</span>
+        <span class="navbar-brand">relay monitor</span>
         <div class="navbar-links">
             <a href="/">总览</a>
-            <a href="/models">模型视图</a>
-            <a href="/fingerprint">指纹鉴别</a>
+            <a href="/models">模型</a>
+            <a href="/fingerprint">指纹</a>
             <a href="/proxy">Proxy</a>
         </div>
         <div class="navbar-right">
@@ -26,9 +25,9 @@
     <div class="status-bar">
         <div class="last-check" id="status-text">
             {{if .IsChecking}}
-                <span style="color:var(--accent)">检测中...</span>
+                <span style="color:var(--accent)">&#9678; 检测中...</span>
             {{else}}
-                上次检测: {{if .LastCheckTime}}{{.LastCheckTime}}{{else}}尚未检测{{end}}
+                <span style="opacity:0.6">&#9679;</span> 上次检测: {{if .LastCheckTime}}{{.LastCheckTime}}{{else}}尚未检测{{end}}
             {{end}}
         </div>
         <button class="btn btn-sm btn-primary"
@@ -49,10 +48,10 @@
     <!-- Live task panel, hidden by default -->
     <div id="task-panel" class="task-panel" style="display:none">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-            <strong style="font-size:0.8rem;color:var(--accent)">任务进度</strong>
-            <span id="task-summary" style="font-size:0.75rem;color:var(--text-dim)"></span>
+            <strong style="font-size:0.78rem;color:var(--accent);font-family:var(--mono)">TASK PROGRESS</strong>
+            <span id="task-summary" style="font-size:0.72rem;color:var(--text-dim);font-family:var(--mono)"></span>
         </div>
-        <div id="task-log" style="font-size:0.75rem;font-family:monospace;max-height:120px;overflow-y:auto;color:var(--text-dim);line-height:1.6"></div>
+        <div id="task-log" style="font-size:0.72rem;font-family:var(--mono);max-height:120px;overflow-y:auto;color:var(--text-dim);line-height:1.7"></div>
     </div>
 
     <div class="main">
@@ -68,11 +67,21 @@
     var taskSummary = document.getElementById('task-summary');
     var statusText = document.getElementById('status-text');
 
+    // Highlight active nav link
+    var path = location.pathname;
+    document.querySelectorAll('.navbar-links a').forEach(function(a) {
+        if (path === a.getAttribute('href') || (a.getAttribute('href') !== '/' && path.startsWith(a.getAttribute('href')))) {
+            a.classList.add('active');
+        } else if (a.getAttribute('href') === '/' && path === '/') {
+            a.classList.add('active');
+        }
+    });
+
     es.addEventListener('check_started', function(e) {
         panel.style.display = 'block';
         taskLog.innerHTML = '';
         taskSummary.textContent = e.data;
-        statusText.innerHTML = '<span style="color:var(--accent)">检测中... ' + e.data + '</span>';
+        statusText.innerHTML = '<span style="color:var(--accent)">&#9678; 检测中... ' + e.data + '</span>';
     });
 
     es.addEventListener('check_progress', function(e) {
@@ -84,7 +93,7 @@
     });
 
     es.addEventListener('provider_done', function(e) {
-        statusText.innerHTML = '<span style="color:var(--accent)">检测中... ' + e.data + ' 完成</span>';
+        statusText.innerHTML = '<span style="color:var(--accent)">&#9678; 检测中... ' + e.data + ' 完成</span>';
     });
 
     es.addEventListener('check_completed', function(e) {

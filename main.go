@@ -100,7 +100,7 @@ func main() {
 		return
 	}
 
-	if len(providers) == 0 {
+	if len(providers) == 0 && !serveMode {
 		fmt.Printf("No providers configured. Use --add or edit %s\n", cfg.ProvidersFile)
 		return
 	}
@@ -222,7 +222,7 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 				srv.RunCheckAndStore(ctx, providers, "warmup", checker.ModeQuick)
 			}()
 		}
-		log.Printf("Proxy: http://localhost%s/v1", cfg.Listen)
+		log.Printf("Proxy: http://%s/v1", cfg.Listen)
 	}
 
 	// Create scheduler: 8h interval, full test (not quick)

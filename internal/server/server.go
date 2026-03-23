@@ -240,7 +240,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("Dashboard: http://localhost%s", s.cfg.Listen)
+	log.Printf("Dashboard: http://%s", s.cfg.Listen)
 	if err := s.httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		return err
 	}
@@ -1225,7 +1225,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if s.proxy != nil {
 		cfg := s.proxy.Config()
 		pd.ProxyEnabled = cfg.Enabled
-		pd.ProxyEndpoint = fmt.Sprintf("http://localhost%s/v1", s.cfg.Listen)
+		if s.cfg.ExternalURL != "" {
+			pd.ProxyEndpoint = strings.TrimRight(s.cfg.ExternalURL, "/") + "/v1"
+		} else {
+			pd.ProxyEndpoint = fmt.Sprintf("http://%s/v1", s.cfg.Listen)
+		}
 		pd.ProxyAPIKey = cfg.APIKey
 		pd.ProxyWarming = !s.proxy.Table().Ready()
 
