@@ -17,6 +17,7 @@ import (
 	"relay-monitor/internal/config"
 	"relay-monitor/internal/notifier"
 	"relay-monitor/internal/provider"
+	"relay-monitor/internal/proxy"
 	"relay-monitor/internal/scheduler"
 	"relay-monitor/internal/store"
 	"relay-monitor/web"
@@ -33,6 +34,7 @@ type Server struct {
 	sseHub    *SSEHub
 	sched     *scheduler.Scheduler
 	notifier  *notifier.Notifier
+	proxy     *proxy.Proxy
 
 	mu         sync.Mutex
 	isChecking bool
@@ -163,7 +165,7 @@ func New(cfg *config.AppConfig, st *store.Store, eng *checker.Engine, providers 
 	}
 
 	// Parse each page template independently with layout to avoid define conflicts
-	pages := []string{"dashboard.html", "provider.html", "models.html", "add_provider.html", "fingerprint.html"}
+	pages := []string{"dashboard.html", "provider.html", "models.html", "add_provider.html", "fingerprint.html", "proxy.html"}
 	tmpls := make(map[string]*template.Template)
 	for _, page := range pages {
 		t, err := template.New("").Funcs(funcMap).ParseFS(tmplFS, "layout.html", page)
@@ -217,6 +219,15 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /api/v1/events/read", s.handleMarkEventsRead)
 	mux.HandleFunc("GET /api/v1/sse", s.sseHub.HandleSSE)
 
+	// Proxy routes (only when proxy is configured)
+	if s.proxy != nil {
+		mux.HandleFunc("/v1/chat/completions", s.proxy.HandleChatCompletions())
+		mux.HandleFunc("/v1/responses", s.proxy.HandleResponses())
+		mux.HandleFunc("/v1/models", s.proxy.HandleModels())
+		mux.HandleFunc("GET /proxy", s.handleProxy)
+		mux.HandleFunc("GET /api/v1/proxy/stats", s.handleProxyStats)
+	}
+
 	s.httpSrv = &http.Server{
 		Addr:    s.cfg.Listen,
 		Handler: mux,
@@ -244,6 +255,11 @@ func (s *Server) SetScheduler(sched *scheduler.Scheduler) {
 // SetNotifier wires the notifier into the server.
 func (s *Server) SetNotifier(n *notifier.Notifier) {
 	s.notifier = n
+}
+
+// SetProxy wires the reverse proxy into the server.
+func (s *Server) SetProxy(p *proxy.Proxy) {
+	s.proxy = p
 }
 
 // RunCheckAndStore runs a check, persists results per-provider as they complete.
@@ -305,7 +321,10 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 	logFn := func(msg string) {
 		ts := time.Now().Format("15:04:05")
 		log.Printf("[%s] %s", ts, msg)
+		s.sseHub.Publish(SSEEvent{Type: "check_progress", Data: msg})
 	}
+
+	s.sseHub.Publish(SSEEvent{Type: "check_started", Data: fmt.Sprintf("%d 个站点", len(provs))})
 
 	// Each provider's results are written immediately when it finishes
 	s.engine.RunCheck(ctx, provs, mode, logFn, func(pr *checker.ProviderResult) {
@@ -412,6 +431,14 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 	totalMu.Unlock()
 	s.store.FinishCheckRun(runID, totalProviders, totalModels, totalOK, totalCorrect, summary)
 	s.sseHub.Publish(SSEEvent{Type: "check_completed", Data: summary})
+
+	// Rebuild proxy routing table with fresh check data
+	if s.proxy != nil {
+		results, _ := s.store.GetLatestResults()
+		dbProviders, _ := s.store.GetProviders()
+		s.proxy.RebuildTable(results, dbProviders, s.providers)
+		log.Printf("[proxy] routing table rebuilt: %d models", len(s.proxy.Table().Models()))
+	}
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -1159,10 +1186,156 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	config.SaveProviders(s.cfg.ProvidersFile, provs)
 
+	// Update DB provider name so store stays in sync
+	if newName != "" && newName != name {
+		dp, err := s.store.GetProviderByName(name)
+		if err == nil && dp != nil {
+			s.store.RenameProvider(dp.ID, newName)
+		}
+	}
+
 	redirect := "/provider/" + name
 	if newName != "" && newName != name {
 		redirect = "/provider/" + newName
 	}
 	w.Header().Set("HX-Redirect", redirect)
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
+	data := s.basePageData("Proxy")
+
+	type ProxyPageData struct {
+		pageData
+		ProxyEnabled   bool
+		ProxyEndpoint  string
+		ProxyAPIKey    string
+		ProxyWarming   bool
+		ProxyModels    []proxyModelStat
+		ProxyProviders []proxyProviderStat
+		ModelCatalog   []proxy.ModelInfo
+		TotalRequests  int64
+		TotalErrors    int64
+		AvgLatencyMs   int64
+		ModelCount     int
+	}
+
+	pd := ProxyPageData{pageData: data}
+
+	if s.proxy != nil {
+		cfg := s.proxy.Config()
+		pd.ProxyEnabled = cfg.Enabled
+		pd.ProxyEndpoint = fmt.Sprintf("http://localhost%s/v1", s.cfg.Listen)
+		pd.ProxyAPIKey = cfg.APIKey
+		pd.ProxyWarming = !s.proxy.Table().Ready()
+
+		// Aggregate stats
+		snap := s.proxy.Stats().Snapshot()
+		modelStats := make(map[string]*proxyModelStat)
+		providerStats := make(map[int64]*proxyProviderStat)
+		var totalReqs, totalErrs, totalLatency int64
+
+		// Get provider names
+		dbProviders, _ := s.store.GetProviders()
+		nameByID := make(map[int64]string)
+		for _, p := range dbProviders {
+			nameByID[p.ID] = p.Name
+		}
+
+		modelProviderCount := s.proxy.Table().ModelProviderCount()
+
+		for _, ss := range snap {
+			totalReqs += ss.Requests
+			totalErrs += ss.Errors
+			totalLatency += ss.AvgLatencyMs * ss.Requests
+
+			ms, ok := modelStats[ss.Model]
+			if !ok {
+				ms = &proxyModelStat{Model: ss.Model, Providers: modelProviderCount[ss.Model]}
+				modelStats[ss.Model] = ms
+			}
+			ms.Requests += ss.Requests
+			ms.Errors += ss.Errors
+
+			pname := nameByID[ss.ProviderID]
+			if pname == "" {
+				pname = fmt.Sprintf("id:%d", ss.ProviderID)
+			}
+			ps, ok := providerStats[ss.ProviderID]
+			if !ok {
+				ps = &proxyProviderStat{ProviderName: pname, ProviderID: ss.ProviderID}
+				providerStats[ss.ProviderID] = ps
+			}
+			ps.Requests += ss.Requests
+			ps.Errors += ss.Errors
+		}
+
+		pd.TotalRequests = totalReqs
+		pd.TotalErrors = totalErrs
+		if totalReqs > 0 {
+			pd.AvgLatencyMs = totalLatency / totalReqs
+		}
+
+		for _, ms := range modelStats {
+			if ms.Requests > 0 {
+				ms.ErrorRate = float64(ms.Errors) / float64(ms.Requests) * 100
+			}
+			pd.ProxyModels = append(pd.ProxyModels, *ms)
+		}
+		sort.Slice(pd.ProxyModels, func(i, j int) bool {
+			return pd.ProxyModels[i].Requests > pd.ProxyModels[j].Requests
+		})
+
+		provModelCount := s.proxy.Table().ProviderModelCount()
+		for _, ps := range providerStats {
+			ps.RoutingModels = provModelCount[ps.ProviderID]
+			if ps.Requests > 0 {
+				ps.ErrorRate = float64(ps.Errors) / float64(ps.Requests) * 100
+			}
+			pd.ProxyProviders = append(pd.ProxyProviders, *ps)
+		}
+		sort.Slice(pd.ProxyProviders, func(i, j int) bool {
+			return pd.ProxyProviders[i].Requests > pd.ProxyProviders[j].Requests
+		})
+
+		// Model catalog (always available, independent of request stats)
+		pd.ModelCatalog = s.proxy.Table().ModelCatalog()
+		pd.ModelCount = len(pd.ModelCatalog)
+	}
+
+	s.tmpls["proxy.html"].ExecuteTemplate(w, "layout.html", pd)
+}
+
+type proxyModelStat struct {
+	Model     string
+	Requests  int64
+	Errors    int64
+	ErrorRate float64
+	Providers int
+}
+
+type proxyProviderStat struct {
+	ProviderName  string
+	ProviderID    int64
+	Requests      int64
+	Errors        int64
+	ErrorRate     float64
+	RoutingModels int
+}
+
+func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"enabled": false})
+		return
+	}
+
+	snap := s.proxy.Stats().Snapshot()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"enabled":  s.proxy.Config().Enabled,
+		"ready":    s.proxy.Table().Ready(),
+		"models":   s.proxy.Table().Models(),
+		"stats":    snap,
+	})
 }

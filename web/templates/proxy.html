@@ -1,0 +1,145 @@
+{{template "layout.html" .}}
+{{define "content"}}
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <h2>Proxy</h2>
+</div>
+
+{{if not .ProxyEnabled}}
+<div class="card" style="padding:24px;text-align:center;color:#888">
+    <p>代理未启用。在 <code>config.toml</code> 中设置 <code>[proxy] enabled = true</code> 后重启。</p>
+</div>
+{{else}}
+
+<div class="card" style="padding:16px;margin-bottom:16px">
+    <div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap">
+        <div>
+            <span style="font-size:12px;color:#888;text-transform:uppercase">状态</span><br>
+            {{if .ProxyWarming}}
+                <span class="status-badge status-degraded">Warming Up</span>
+            {{else}}
+                <span class="status-badge status-ok">Active</span>
+            {{end}}
+        </div>
+        <div>
+            <span style="font-size:12px;color:#888;text-transform:uppercase">Endpoint</span><br>
+            <code id="proxy-endpoint">{{.ProxyEndpoint}}</code>
+        </div>
+        <div>
+            <span style="font-size:12px;color:#888;text-transform:uppercase">API Key</span><br>
+            <code id="proxy-key" style="cursor:pointer" onclick="copyKey()" title="点击复制">{{if .ProxyAPIKey}}sk-relay-•••••{{else}}未设置{{end}}</code>
+            <input type="hidden" id="proxy-key-full" value="{{.ProxyAPIKey}}">
+        </div>
+        <div>
+            <span style="font-size:12px;color:#888;text-transform:uppercase">请求</span><br>
+            <strong>{{.TotalRequests}}</strong>
+        </div>
+        <div>
+            <span style="font-size:12px;color:#888;text-transform:uppercase">错误</span><br>
+            <strong>{{.TotalErrors}}</strong>
+        </div>
+        <div>
+            <span style="font-size:12px;color:#888;text-transform:uppercase">平均延迟</span><br>
+            <strong>{{.AvgLatencyMs}}ms</strong>
+        </div>
+        <div>
+            <span style="font-size:12px;color:#888;text-transform:uppercase">可用模型</span><br>
+            <strong>{{.ModelCount}}</strong>
+        </div>
+    </div>
+</div>
+
+{{if .ModelCatalog}}
+<h3 style="margin-bottom:8px">可用模型</h3>
+<table class="results-table" style="margin-bottom:24px">
+    <thead>
+        <tr>
+            <th>模型</th>
+            <th>厂商</th>
+            <th>Provider 数</th>
+            <th>最佳延迟</th>
+            <th>最佳 Provider</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range .ModelCatalog}}
+        <tr>
+            <td><code>{{.Model}}</code></td>
+            <td>{{.Vendor}}</td>
+            <td>{{.Providers}}</td>
+            <td>{{printf "%.2f" (divf .BestLatency 1000.0)}}s</td>
+            <td>{{.BestProvider}}</td>
+        </tr>
+        {{end}}
+    </tbody>
+</table>
+{{end}}
+
+{{if .ProxyModels}}
+<h3 style="margin-bottom:8px">模型流量</h3>
+<table class="results-table" style="margin-bottom:24px">
+    <thead>
+        <tr>
+            <th>模型</th>
+            <th>请求数</th>
+            <th>错误率</th>
+            <th>Provider 数</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range .ProxyModels}}
+        <tr>
+            <td><code>{{.Model}}</code></td>
+            <td>{{.Requests}}</td>
+            <td>{{printf "%.1f%%" .ErrorRate}}</td>
+            <td>{{.Providers}}</td>
+        </tr>
+        {{end}}
+    </tbody>
+</table>
+{{end}}
+
+{{if .ProxyProviders}}
+<h3 style="margin-bottom:8px">Provider 路由</h3>
+<table class="results-table">
+    <thead>
+        <tr>
+            <th>Provider</th>
+            <th>请求数</th>
+            <th>错误率</th>
+            <th>路由模型数</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range .ProxyProviders}}
+        <tr>
+            <td>{{.ProviderName}}</td>
+            <td>{{.Requests}}</td>
+            <td>{{printf "%.1f%%" .ErrorRate}}</td>
+            <td>{{.RoutingModels}}</td>
+        </tr>
+        {{end}}
+    </tbody>
+</table>
+{{end}}
+
+{{if and (not .ProxyModels) (not .ProxyWarming)}}
+<div class="card" style="padding:24px;text-align:center;color:#888">
+    <p>暂无代理请求数据。使用上方的 Endpoint 和 API Key 发送请求。</p>
+</div>
+{{end}}
+
+{{end}}
+
+<script>
+function copyKey() {
+    var key = document.getElementById('proxy-key-full').value;
+    if (!key) return;
+    navigator.clipboard.writeText(key).then(function() {
+        var el = document.getElementById('proxy-key');
+        var orig = el.textContent;
+        el.textContent = '已复制!';
+        setTimeout(function() { el.textContent = orig; }, 1500);
+    });
+}
+</script>
+{{end}}

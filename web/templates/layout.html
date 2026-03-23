@@ -7,6 +7,7 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F4E1;</text></svg>">
     <link rel="stylesheet" href="/static/style.css">
     <script src="/static/htmx.min.js"></script>
+    <style>.task-panel{background:var(--bg-card);border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin:0 auto 0;max-width:1200px;}</style>
 </head>
 <body>
     <nav class="navbar">
@@ -15,6 +16,7 @@
             <a href="/">总览</a>
             <a href="/models">模型视图</a>
             <a href="/fingerprint">指纹鉴别</a>
+            <a href="/proxy">Proxy</a>
         </div>
         <div class="navbar-right">
             <a href="/provider/add" class="btn btn-sm btn-primary">+ 添加站点</a>
@@ -22,9 +24,9 @@
     </nav>
 
     <div class="status-bar">
-        <div class="last-check">
+        <div class="last-check" id="status-text">
             {{if .IsChecking}}
-                <span class="htmx-indicator" style="opacity:1">检测中...</span>
+                <span style="color:var(--accent)">检测中...</span>
             {{else}}
                 上次检测: {{if .LastCheckTime}}{{.LastCheckTime}}{{else}}尚未检测{{end}}
             {{end}}
@@ -44,6 +46,15 @@
         {{end}}
     </div>
 
+    <!-- Live task panel, hidden by default -->
+    <div id="task-panel" class="task-panel" style="display:none">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <strong style="font-size:0.8rem;color:var(--accent)">任务进度</strong>
+            <span id="task-summary" style="font-size:0.75rem;color:var(--text-dim)"></span>
+        </div>
+        <div id="task-log" style="font-size:0.75rem;font-family:monospace;max-height:120px;overflow-y:auto;color:var(--text-dim);line-height:1.6"></div>
+    </div>
+
     <div class="main">
         {{block "content" .}}{{end}}
     </div>
@@ -52,17 +63,34 @@
 (function() {
     var es = new EventSource('/api/v1/sse');
     var reloadTimer = null;
+    var panel = document.getElementById('task-panel');
+    var taskLog = document.getElementById('task-log');
+    var taskSummary = document.getElementById('task-summary');
+    var statusText = document.getElementById('status-text');
 
-    // 巡检全部完成后刷新一次，不再逐事件刷新
-    es.addEventListener('check_completed', function() {
-        if (reloadTimer) clearTimeout(reloadTimer);
-        reloadTimer = setTimeout(function() { location.reload(); }, 500);
+    es.addEventListener('check_started', function(e) {
+        panel.style.display = 'block';
+        taskLog.innerHTML = '';
+        taskSummary.textContent = e.data;
+        statusText.innerHTML = '<span style="color:var(--accent)">检测中... ' + e.data + '</span>';
     });
 
-    // provider 完成时更新状态栏提示，不刷新整页
+    es.addEventListener('check_progress', function(e) {
+        panel.style.display = 'block';
+        var line = document.createElement('div');
+        line.textContent = e.data;
+        taskLog.appendChild(line);
+        taskLog.scrollTop = taskLog.scrollHeight;
+    });
+
     es.addEventListener('provider_done', function(e) {
-        var bar = document.querySelector('.last-check');
-        if (bar) bar.innerHTML = '<span style="opacity:0.7">检测中... ' + e.data + ' 完成</span>';
+        statusText.innerHTML = '<span style="color:var(--accent)">检测中... ' + e.data + ' 完成</span>';
+    });
+
+    es.addEventListener('check_completed', function(e) {
+        panel.style.display = 'none';
+        if (reloadTimer) clearTimeout(reloadTimer);
+        reloadTimer = setTimeout(function() { location.reload(); }, 500);
     });
 
     es.onerror = function() {

@@ -15,6 +15,7 @@ import (
 	"relay-monitor/internal/checker"
 	"relay-monitor/internal/config"
 	"relay-monitor/internal/provider"
+	"relay-monitor/internal/proxy"
 	"relay-monitor/internal/scheduler"
 	"relay-monitor/internal/server"
 	"relay-monitor/internal/store"
@@ -196,6 +197,33 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 	}
 	// Toast notifications disabled — user prefers checking dashboard manually
 	// srv.SetNotifier(notifier.New())
+
+	// Set up proxy if enabled
+	if cfg.Proxy.Enabled {
+		proxyCfg := cfg.Proxy
+		// Auto-generate API key if empty
+		if proxyCfg.APIKey == "" {
+			proxyCfg.APIKey = "sk-relay-" + fmt.Sprintf("%d", time.Now().UnixNano())
+			log.Printf("Proxy API key (auto-generated): %s", proxyCfg.APIKey)
+		}
+		p := proxy.New(&proxyCfg, engine.Client)
+		srv.SetProxy(p)
+
+		// Try to populate routing table from existing check data
+		results, _ := st.GetLatestResults()
+		dbProviders, _ := st.GetProviders()
+		if len(results) > 0 {
+			p.RebuildTable(results, dbProviders, providers)
+			log.Printf("[proxy] routing table loaded: %d models", len(p.Table().Models()))
+		} else {
+			// No check data yet — trigger a warmup quick check
+			log.Printf("[proxy] no check data, running warmup check...")
+			go func() {
+				srv.RunCheckAndStore(ctx, providers, "warmup", checker.ModeQuick)
+			}()
+		}
+		log.Printf("Proxy: http://localhost%s/v1", cfg.Listen)
+	}
 
 	// Create scheduler: 8h interval, full test (not quick)
 	sched := scheduler.New(cfg.CheckInterval.Duration, func(sctx context.Context) {

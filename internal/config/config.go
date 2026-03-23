@@ -27,17 +27,28 @@ func (d Duration) MarshalText() ([]byte, error) {
 	return []byte(d.Duration.String()), nil
 }
 
+// ProxyConfig holds reverse-proxy settings.
+type ProxyConfig struct {
+	Enabled                bool     `toml:"enabled"`
+	APIKey                 string   `toml:"api_key"`
+	RequestTimeout         Duration `toml:"request_timeout"`
+	StreamFirstByteTimeout Duration `toml:"stream_first_byte_timeout"`
+	StreamIdleTimeout      Duration `toml:"stream_idle_timeout"`
+	MaxRetries             int      `toml:"max_retries"`
+}
+
 // AppConfig holds all application settings.
 type AppConfig struct {
-	Listen           string  `toml:"listen"`
-	CheckInterval    Duration `toml:"check_interval"`
-	RetentionDays    int     `toml:"retention_days"`
-	MaxConcurrency   int     `toml:"max_concurrency"`
-	RequestInterval  Duration `toml:"request_interval"`
-	SSLVerify        bool    `toml:"ssl_verify"`
-	DataDir          string  `toml:"data_dir"`
-	BalanceThreshold float64 `toml:"balance_threshold"`
-	ProvidersFile    string  `toml:"providers_file"`
+	Listen           string      `toml:"listen"`
+	CheckInterval    Duration    `toml:"check_interval"`
+	RetentionDays    int         `toml:"retention_days"`
+	MaxConcurrency   int         `toml:"max_concurrency"`
+	RequestInterval  Duration    `toml:"request_interval"`
+	SSLVerify        bool        `toml:"ssl_verify"`
+	DataDir          string      `toml:"data_dir"`
+	BalanceThreshold float64     `toml:"balance_threshold"`
+	ProvidersFile    string      `toml:"providers_file"`
+	Proxy            ProxyConfig `toml:"proxy"`
 }
 
 // DefaultConfig returns an AppConfig with sensible defaults.
@@ -52,6 +63,12 @@ func DefaultConfig() *AppConfig {
 		DataDir:          ".",
 		BalanceThreshold: 5.0,
 		ProvidersFile:    "providers.json",
+		Proxy: ProxyConfig{
+			RequestTimeout:         Duration{30 * time.Second},
+			StreamFirstByteTimeout: Duration{30 * time.Second},
+			StreamIdleTimeout:      Duration{60 * time.Second},
+			MaxRetries:             2,
+		},
 	}
 }
 

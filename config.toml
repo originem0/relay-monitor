@@ -8,3 +8,11 @@ ssl_verify = false
 data_dir = "."
 balance_threshold = 5.0
 providers_file = "providers.json"
+
+[proxy]
+enabled = true
+api_key = "sk-relay-zhou"
+request_timeout = "30s"
+stream_first_byte_timeout = "30s"
+stream_idle_timeout = "60s"
+max_retries = 2

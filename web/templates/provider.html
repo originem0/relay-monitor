@@ -9,11 +9,15 @@
         {{.Provider.Health}}
     </div>
     <button class="btn btn-sm"
+            id="btn-test-provider"
             hx-post="/api/v1/check/trigger/{{.Provider.Name}}"
             hx-target="#check-feedback"
-            hx-swap="innerHTML">
-        检测全部模型
+            hx-swap="innerHTML"
+            hx-disabled-elt="this"
+            hx-indicator="#check-spinner">
+        测试当前站点模型
     </button>
+    <span id="check-spinner" class="htmx-indicator" style="font-size:0.85rem;color:var(--accent)">测试中...</span>
     <button class="btn btn-sm"
             hx-post="/api/v1/providers/{{.Provider.Name}}/pin"
             hx-swap="none">

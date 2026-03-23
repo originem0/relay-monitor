@@ -235,6 +235,11 @@ func (s *Store) UpdateProviderBalance(id int64, balance float64) error {
 	return err
 }
 
+func (s *Store) RenameProvider(id int64, newName string) error {
+	_, err := s.db.Exec(`UPDATE providers SET name = ?, updated_at = datetime('now') WHERE id = ?`, newName, id)
+	return err
+}
+
 func (s *Store) UpdateProviderPlatform(id int64, platform string) error {
 	_, err := s.db.Exec(`UPDATE providers SET platform = ?, updated_at = datetime('now') WHERE id = ?`, platform, id)
 	return err

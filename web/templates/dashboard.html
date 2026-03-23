@@ -9,7 +9,6 @@
             <span class="provider-name">{{.Name}}</span>
             {{if and .Platform (ne .Platform "unknown")}}<span class="platform-tag">{{.Platform}}</span>{{end}}
         </div>
-        {{if .Note}}<div class="provider-note">{{.Note}}</div>{{end}}
         {{if .ErrorMsg}}<div class="provider-error">{{.ErrorMsg}}</div>{{end}}
         <div class="provider-stats">
             <span><span class="stat-value">{{.ModelsOK}}/{{.ModelsTotal}}</span> 正确</span>
@@ -17,7 +16,8 @@
             {{if .Balance}}<span>余额 <span class="stat-value">${{printf "%.2f" (quota2usd (deref .Balance))}}</span></span>{{end}}
         </div>
         <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
-            <div class="health-badge {{if ge .Health 80}}health-good{{else if ge .Health 50}}health-warn{{else}}health-bad{{end}}">
+            {{if .Note}}<span class="provider-note" style="flex:1">{{.Note}}</span>{{end}}
+            <div class="health-badge {{if ge .Health 80}}health-good{{else if ge .Health 50}}health-warn{{else}}health-bad{{end}}" style="margin-left:auto">
                 {{.Health}}
             </div>
             <span class="health-label">健康分</span>
