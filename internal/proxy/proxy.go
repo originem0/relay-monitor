@@ -51,8 +51,8 @@ func (p *Proxy) SetWarming(v bool)               { p.warming.Store(v) }
 func (p *Proxy) UpdateConfig(cfg *config.ProxyConfig) { p.cfg.Store(cfg) }
 
 // RebuildTable rebuilds the routing table from fresh check data.
-func (p *Proxy) RebuildTable(results []store.CheckResultRow, dbProviders []store.ProviderRow, memProviders []provider.Provider) {
-	p.table.Rebuild(results, dbProviders, memProviders, p.breakers)
+func (p *Proxy) RebuildTable(results []store.CheckResultRow, dbProviders []store.ProviderRow, memProviders []provider.Provider, fingerprints map[[2]string]FingerprintScore) {
+	p.table.Rebuild(results, dbProviders, memProviders, fingerprints)
 	if p.table.Ready() {
 		p.warming.Store(false)
 	}
@@ -160,7 +160,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 	}
 
 	// Get routing candidates
-	candidates := p.table.Select(req.Model, apiFormat)
+	candidates := p.table.Select(req.Model, apiFormat, p.stats, p.breakers)
 	if len(candidates) == 0 {
 		writeError(w, 404, "model_not_found",
 			fmt.Sprintf("Model '%s' is not available on any healthy provider", req.Model))
@@ -186,8 +186,13 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 			return
 		}
 
-		p.breakers.RecordFailure(candidate.ProviderID, req.Model)
+		// Record stats error for all failure types
 		p.stats.Record(candidate.ProviderID, req.Model, elapsed, true)
+
+		// Only trigger circuit breaker for transient failures (5xx, 429, timeout)
+		if result == forwardRetry {
+			p.breakers.RecordFailure(candidate.ProviderID, req.Model)
+		}
 
 		if done {
 			// Response already started (streaming), can't retry
@@ -205,9 +210,10 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 type forwardResult int
 
 const (
-	forwardOK    forwardResult = iota
-	forwardRetry               // failed, can retry (nothing sent to client)
-	forwardDone                // failed, but response already started (streaming)
+	forwardOK       forwardResult = iota
+	forwardRetry                          // failed, can retry, counts as breaker failure
+	forwardRetryMild                      // failed, can retry, but NOT a breaker failure (e.g. 403 quota)
+	forwardDone                           // failed, but response already started (streaming)
 )
 
 func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, apiKey string, body []byte, stream bool, w http.ResponseWriter, origReq *http.Request) (forwardResult, bool) {
@@ -235,33 +241,35 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 	if err != nil {
 		return forwardRetry, false
 	}
-	defer func() {
-		// Only close if we haven't handed off to streaming
-		if !stream || resp.StatusCode != 200 {
-			resp.Body.Close()
-		}
-	}()
 
-	// Non-200: retryable
+	// 5xx, 429 (rate limit): transient failure, retry on next provider
 	if resp.StatusCode >= 500 || resp.StatusCode == 429 {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return forwardRetry, false
 	}
 
-	// 4xx (not 429): client error, don't retry, forward as-is
+	// 403 (quota exhausted): retry but don't trigger circuit breaker
+	if resp.StatusCode == 403 {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return forwardRetryMild, false
+	}
+
+	// Other 4xx: client error, don't retry, forward as-is
 	if resp.StatusCode >= 400 {
 		copyResponse(w, resp)
+		resp.Body.Close()
 		return forwardRetry, true // done=true because we wrote the response
 	}
 
 	if !stream || resp.StatusCode != 200 {
-		// Non-streaming success or non-200 streaming: copy entire response
 		copyResponse(w, resp)
+		resp.Body.Close()
 		return forwardOK, true
 	}
 
-	// Streaming: pipe SSE chunks
+	// Streaming: pipe SSE chunks (takes ownership of resp.Body)
 	return p.pipeStream(w, resp, cfg), true
 }
 
@@ -315,9 +323,11 @@ func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *conf
 		}
 		return forwardOK
 	case <-idle.C:
-		// Upstream went silent mid-stream
+		// Upstream went silent mid-stream; close body to unblock scanner goroutine
+		resp.Body.Close()
 		fmt.Fprintf(w, "data: {\"error\":{\"message\":\"upstream timeout\"}}\n\ndata: [DONE]\n\n")
 		flusher.Flush()
+		<-done // wait for goroutine to exit
 		return forwardDone
 	}
 }

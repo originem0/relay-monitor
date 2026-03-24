@@ -16,10 +16,20 @@
         </select>
     </div>
     <div class="filter-group">
+        <label>指纹</label>
+        <select id="filter-fp" onchange="filterModels()">
+            <option value="">全部</option>
+            <option value="genuine">GENUINE</option>
+            <option value="has">有结果</option>
+            <option value="none">无结果</option>
+        </select>
+    </div>
+    <div class="filter-group">
         <label>排序</label>
         <select id="sort-by" onchange="filterModels()">
             <option value="providers">可用站数</option>
             <option value="latency">最低延迟</option>
+            <option value="fpscore">指纹分数</option>
             <option value="name">名称</option>
         </select>
     </div>
@@ -40,7 +50,7 @@
         </thead>
         <tbody>
             {{range .ModelGroups}}
-            <tr class="model-row" data-vendor="{{.Vendor}}" data-compat="{{if .CCCompat}}cc{{end}}" data-providers="{{.AvailableCount}}" data-latency="{{.BestLatencyMs}}" data-name="{{.Model}}">
+            <tr class="model-row" data-vendor="{{.Vendor}}" data-compat="{{if .CCCompat}}cc{{end}}" data-providers="{{.AvailableCount}}" data-latency="{{.BestLatencyMs}}" data-name="{{.Model}}" data-fpscore="{{.BestFPScore}}">
                 <td>
                     <span class="expand-toggle" onclick="toggleExpand(this)">&#9654;</span>
                 </td>
@@ -75,7 +85,7 @@
                                     <td>{{.ProviderName}}</td>
                                     <td>{{if .LatencyMs}}{{printf "%.1f" (divf .LatencyMs 1000.0)}}s{{else}}-{{end}}</td>
                                     <td>{{if .Correct}}<span class="text-ok">&#10003;</span>{{else}}<span class="text-err">&#10007;</span>{{end}}</td>
-                                    <td>{{if .Verdict}}<span class="verdict-{{.VerdictClass}}">{{.Verdict}}</span>{{else}}<span class="text-dim">-</span>{{end}}</td>
+                                    <td>{{if .Verdict}}<span class="verdict-{{.VerdictClass}}">{{.Verdict}}</span> <span class="text-dim">({{.FPScore}}/10)</span>{{else}}<span class="text-dim">-</span>{{end}}</td>
                                     <td>{{if eq .ToolUse "true"}}<span class="text-ok">&#10003;</span>{{else if eq .ToolUse "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
                                     <td>{{if eq .Streaming "true"}}<span class="text-ok">&#10003;</span>{{else if eq .Streaming "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
                                     <td>
@@ -120,13 +130,42 @@ function toggleExpand(el) {
 function filterModels() {
     var vendor = document.getElementById('filter-vendor').value;
     var compat = document.getElementById('filter-compat').value;
+    var fp = document.getElementById('filter-fp').value;
+    var sortBy = document.getElementById('sort-by').value;
+    var tbody = document.querySelector('#models-table tbody');
+    var pairs = []; // [{row, detail}]
     var rows = document.querySelectorAll('.model-row');
     rows.forEach(function(r) {
+        pairs.push({row: r, detail: r.nextElementSibling});
+    });
+
+    // Sort
+    pairs.sort(function(a, b) {
+        if (sortBy === 'providers') return (parseInt(b.row.dataset.providers)||0) - (parseInt(a.row.dataset.providers)||0);
+        if (sortBy === 'latency') {
+            var la = parseInt(a.row.dataset.latency)||999999, lb = parseInt(b.row.dataset.latency)||999999;
+            return la - lb;
+        }
+        if (sortBy === 'fpscore') return (parseInt(b.row.dataset.fpscore)||0) - (parseInt(a.row.dataset.fpscore)||0);
+        return a.row.dataset.name.localeCompare(b.row.dataset.name);
+    });
+
+    // Re-order DOM
+    pairs.forEach(function(p) {
+        tbody.appendChild(p.row);
+        tbody.appendChild(p.detail);
+    });
+
+    // Filter
+    pairs.forEach(function(p) {
         var show = true;
-        if (vendor && r.dataset.vendor !== vendor) show = false;
-        if (compat && !r.dataset.compat) show = false;
-        r.style.display = show ? '' : 'none';
-        r.nextElementSibling.style.display = 'none';
+        if (vendor && p.row.dataset.vendor !== vendor) show = false;
+        if (compat && !p.row.dataset.compat) show = false;
+        if (fp === 'genuine' && parseInt(p.row.dataset.fpscore) < 7) show = false;
+        if (fp === 'has' && parseInt(p.row.dataset.fpscore) === 0) show = false;
+        if (fp === 'none' && parseInt(p.row.dataset.fpscore) > 0) show = false;
+        p.row.style.display = show ? '' : 'none';
+        p.detail.style.display = 'none';
     });
 }
 

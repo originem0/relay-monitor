@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"math"
 	"math/rand"
 	"sort"
 	"sync"
@@ -34,9 +33,16 @@ func NewRoutingTable() *RoutingTable {
 	}
 }
 
+// FingerprintScore holds a fingerprint score for a (provider, model) pair.
+type FingerprintScore struct {
+	TotalScore  int
+	ExpectedMin int
+	Verdict     string
+}
+
 // Rebuild reconstructs the routing table from the latest check results and provider list.
-// providers supplies API keys (not stored in DB). breakers supplies circuit breaker state.
-func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []store.ProviderRow, memProviders []provider.Provider, breakers *Breakers) {
+// fingerprints maps (providerName, model) to fingerprint scores for quality-based routing.
+func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []store.ProviderRow, memProviders []provider.Provider, fingerprints map[[2]string]FingerprintScore) {
 	// Build lookup maps
 	keyByName := make(map[string]string) // provider name → API key
 	for _, p := range memProviders {
@@ -68,22 +74,24 @@ func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []st
 			continue
 		}
 
-		// Score: 0.6 × latency_score + 0.4 × health_score
+		// Score: 0.4 × latency + 0.3 × health + 0.3 × fingerprint
 		latencyScore := 1.0 - clamp(float64(r.LatencyMs)/30000.0, 0, 1)
 		healthScore := healthByID[r.ProviderID] / 100.0
-		score := 0.6*latencyScore + 0.4*healthScore
-
-		// Apply circuit breaker modifier
-		if breakers != nil {
-			switch breakers.GetState(r.ProviderID, r.Model) {
-			case BreakerSuspect:
-				score *= 0.5
-			case BreakerOpen:
-				continue // skip entirely
-			case BreakerHalfOpen:
-				score *= 0.3 // allow but with very low priority
+		fpScore := 0.5 // default when no fingerprint data
+		fpKey := [2]string{r.ProviderName, r.Model}
+		if fp, ok := fingerprints[fpKey]; ok {
+			fpScore = clamp(float64(fp.TotalScore)/10.0, 0, 1)
+			// Penalize suspected/fake heavily
+			if fp.Verdict == "LIKELY FAKE" || fp.Verdict == "FAIL" {
+				fpScore = 0
+			} else if fp.Verdict == "SUSPECTED" || fp.Verdict == "MISMATCH" {
+				fpScore *= 0.3
 			}
 		}
+		score := 0.4*latencyScore + 0.3*healthScore + 0.3*fpScore
+
+		// Circuit breaker is checked at Select time, not Rebuild time.
+		// This ensures providers can recover between rebuilds.
 
 		sp := ScoredProvider{
 			ProviderID:   r.ProviderID,
@@ -120,8 +128,8 @@ func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []st
 }
 
 // Select returns an ordered list of providers for the given model and API format.
-// The first element is the weighted-random primary choice; the rest are failover candidates in score order.
-func (rt *RoutingTable) Select(model, apiFormat string) []ScoredProvider {
+// Breaker state and live error rates are applied dynamically at selection time.
+func (rt *RoutingTable) Select(model, apiFormat string, stats *Stats, breakers *Breakers) []ScoredProvider {
 	rt.mu.RLock()
 	all := rt.models[model]
 	rt.mu.RUnlock()
@@ -130,16 +138,37 @@ func (rt *RoutingTable) Select(model, apiFormat string) []ScoredProvider {
 		return nil
 	}
 
-	// Filter by API format
+	// Filter by API format, apply breaker + error-rate penalties
 	var candidates []ScoredProvider
 	for _, sp := range all {
-		if matchFormat(sp.APIFormat, apiFormat) {
-			candidates = append(candidates, sp)
+		if !matchFormat(sp.APIFormat, apiFormat) {
+			continue
 		}
+		adjusted := sp
+		// Dynamic circuit breaker check
+		if breakers != nil {
+			switch breakers.GetState(sp.ProviderID, model) {
+			case BreakerOpen:
+				continue // skip entirely
+			case BreakerHalfOpen:
+				adjusted.Score *= 0.3
+			case BreakerSuspect:
+				adjusted.Score *= 0.5
+			}
+		}
+		if stats != nil {
+			adjusted.Score = applyErrorPenalty(adjusted, model, stats)
+		}
+		candidates = append(candidates, adjusted)
 	}
 	if len(candidates) == 0 {
 		return nil
 	}
+
+	// Re-sort by adjusted score
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Score > candidates[j].Score
+	})
 
 	// Take top 3 for weighted random selection
 	top := candidates
@@ -147,7 +176,6 @@ func (rt *RoutingTable) Select(model, apiFormat string) []ScoredProvider {
 		top = top[:3]
 	}
 
-	// Weighted random: use softmax-style normalization
 	primary := weightedSelect(top)
 
 	// Build result: primary first, then others in score order
@@ -158,6 +186,20 @@ func (rt *RoutingTable) Select(model, apiFormat string) []ScoredProvider {
 		}
 	}
 	return result
+}
+
+// applyErrorPenalty adjusts a provider's score based on live proxy error rate.
+// Minimum 5 requests before penalty kicks in (avoid penalizing on noise).
+func applyErrorPenalty(sp ScoredProvider, model string, stats *Stats) float64 {
+	v := stats.get(sp.ProviderID, model)
+	reqs := v.Requests.Load()
+	if reqs < 5 {
+		return sp.Score
+	}
+	errs := v.Errors.Load()
+	errorRate := float64(errs) / float64(reqs)
+	// Linear penalty: 10% error rate → score × 0.9, 50% → score × 0.5
+	return sp.Score * (1.0 - errorRate)
 }
 
 // Models returns a deduplicated list of all model names in the routing table.
@@ -249,11 +291,13 @@ func matchFormat(providerFormat, requestFormat string) bool {
 	if providerFormat == "" {
 		providerFormat = "chat"
 	}
-	if requestFormat == "responses" {
-		return providerFormat == "responses"
+	// Most OpenAI-compatible providers support both formats.
+	// Only reject if provider is exclusively "responses" and request is "chat",
+	// since responses-only providers lack /chat/completions endpoint.
+	if requestFormat == "chat" && providerFormat == "responses" {
+		return false
 	}
-	// chat format: accept anything that's not exclusively responses
-	return providerFormat != "responses"
+	return true
 }
 
 func weightedSelect(candidates []ScoredProvider) ScoredProvider {
@@ -261,24 +305,11 @@ func weightedSelect(candidates []ScoredProvider) ScoredProvider {
 		return candidates[0]
 	}
 
-	// Compute weights using exponential scaling
-	weights := make([]float64, len(candidates))
-	total := 0.0
-	for i, c := range candidates {
-		w := math.Exp(c.Score * 3) // scale factor 3 gives good spread
-		weights[i] = w
-		total += w
+	// 90% pick the best, 10% probe a random alternative (health awareness)
+	if rand.Float64() < 0.9 {
+		return candidates[0] // already sorted by score desc
 	}
-
-	r := rand.Float64() * total
-	cumulative := 0.0
-	for i, w := range weights {
-		cumulative += w
-		if r <= cumulative {
-			return candidates[i]
-		}
-	}
-	return candidates[len(candidates)-1]
+	return candidates[1+rand.Intn(len(candidates)-1)]
 }
 
 func clamp(v, min, max float64) float64 {

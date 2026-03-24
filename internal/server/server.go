@@ -84,6 +84,7 @@ type ModelGroup struct {
 	TotalCount     int
 	BestProvider   string
 	BestLatencyMs  int64
+	BestFPScore    int
 	CCCompat       bool
 	Providers      []ModelProviderRow
 }
@@ -97,6 +98,7 @@ type ModelProviderRow struct {
 	Correct      bool
 	Verdict      string
 	VerdictClass string
+	FPScore      int // fingerprint total score (0 = no data)
 	ToolUse      string // "true", "false", ""
 	Streaming    string
 	IsBest       bool
@@ -436,9 +438,26 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 	if s.proxy != nil {
 		results, _ := s.store.GetLatestResults()
 		dbProviders, _ := s.store.GetProviders()
-		s.proxy.RebuildTable(results, dbProviders, s.providers)
+		s.proxy.RebuildTable(results, dbProviders, s.providers, s.buildFingerprintMap())
 		log.Printf("[proxy] routing table rebuilt: %d models", len(s.proxy.Table().Models()))
 	}
+}
+
+// buildFingerprintMap builds a lookup map from (providerName, model) → FingerprintScore.
+func (s *Server) buildFingerprintMap() map[[2]string]proxy.FingerprintScore {
+	fps, err := s.store.GetLatestFingerprints()
+	if err != nil || len(fps) == 0 {
+		return nil
+	}
+	m := make(map[[2]string]proxy.FingerprintScore, len(fps))
+	for _, f := range fps {
+		m[[2]string{f.ProviderName, f.Model}] = proxy.FingerprintScore{
+			TotalScore:  f.TotalScore,
+			ExpectedMin: f.ExpectedMin,
+			Verdict:     f.Verdict,
+		}
+	}
+	return m
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -523,6 +542,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	latestResults, _ := s.store.GetLatestResults()
 	dbProviders, _ := s.store.GetProviders()
 	allCaps, _ := s.store.GetAllCapabilities()
+
+	// Build fingerprint lookup: (providerName, model) → FingerprintRow
+	fpRows, _ := s.store.GetLatestFingerprints()
+	fpByKey := make(map[[2]string]store.FingerprintRow, len(fpRows))
+	for _, f := range fpRows {
+		fpByKey[[2]string{f.ProviderName, f.Model}] = f
+	}
 
 	// Build provider lookup: id -> (name, baseURL)
 	provInfo := make(map[int64][2]string) // [name, baseURL]
@@ -622,9 +648,29 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			// Fill fingerprint verdict
+			if fp, ok := fpByKey[[2]string{pr.providerName, k.model}]; ok {
+				row.Verdict = fp.Verdict
+				row.FPScore = fp.TotalScore
+				switch {
+				case fp.Verdict == "GENUINE":
+					row.VerdictClass = "genuine"
+				case fp.Verdict == "PLAUSIBLE":
+					row.VerdictClass = "plausible"
+				case strings.Contains(fp.Verdict, "SUSPECTED") || strings.Contains(fp.Verdict, "MISMATCH"):
+					row.VerdictClass = "suspected"
+				default:
+					row.VerdictClass = "fake"
+				}
+			}
 			mg.Providers = append(mg.Providers, row)
 		}
 		mg.CCCompat = anyCC
+		for _, pr := range mg.Providers {
+			if pr.FPScore > mg.BestFPScore {
+				mg.BestFPScore = pr.FPScore
+			}
+		}
 
 		data.ModelGroups = append(data.ModelGroups, mg)
 	}
@@ -976,6 +1022,14 @@ func (s *Server) RunFingerprintAndStore(ctx context.Context, provs []provider.Pr
 				fr.ExpectedTier, fr.ExpectedMin, fr.Verdict,
 				fr.SelfID.Verdict, fr.SelfID.Detail, string(answersJSON))
 		}
+	}
+
+	// Rebuild proxy routing table with updated fingerprint scores
+	if s.proxy != nil {
+		results, _ := s.store.GetLatestResults()
+		dbProviders, _ := s.store.GetProviders()
+		s.proxy.RebuildTable(results, dbProviders, s.providers, s.buildFingerprintMap())
+		log.Printf("[proxy] routing table rebuilt with fingerprint data: %d models", len(s.proxy.Table().Models()))
 	}
 }
 

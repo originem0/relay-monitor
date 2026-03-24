@@ -2,7 +2,10 @@
 {{define "content"}}
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
     <h2>指纹鉴别</h2>
-    <button class="btn btn-primary" hx-post="/api/v1/fingerprint/trigger" hx-swap="none">运行指纹检测</button>
+    <div style="display:flex;gap:10px;align-items:center">
+        <button class="btn btn-primary" id="fp-btn" hx-post="/api/v1/fingerprint/trigger" hx-swap="none"
+                hx-on::after-request="if(event.detail.xhr.status===409){var b=document.getElementById('fp-btn');b.textContent='检测正在进行中...';b.disabled=true;setTimeout(function(){b.textContent='运行指纹检测';b.disabled=false},3000)}">运行指纹检测</button>
+    </div>
 </div>
 
 <details class="fingerprint-info" open>

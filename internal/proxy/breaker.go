@@ -146,5 +146,8 @@ func (b *Breakers) ForceState(providerID int64, model string, state BreakerState
 	if state == BreakerHealthy {
 		e.failures = 0
 	}
+	if state == BreakerOpen {
+		e.cooldownUntil = time.Now().Add(cooldownDuration)
+	}
 	e.probeInProgress = false
 }

@@ -3,6 +3,7 @@ package proxy
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type statsKey struct {
@@ -14,7 +15,10 @@ type statsValue struct {
 	Requests     atomic.Int64
 	Errors       atomic.Int64
 	TotalLatency atomic.Int64 // milliseconds
+	windowStart  atomic.Int64 // unix seconds
 }
+
+const statsWindowDuration = 10 * time.Minute
 
 // StatsSnapshot is a point-in-time copy of counters for a (provider, model) pair.
 type StatsSnapshot struct {
@@ -52,6 +56,7 @@ func (s *Stats) get(providerID int64, model string) *statsValue {
 		return v
 	}
 	v = &statsValue{}
+	v.windowStart.Store(time.Now().Unix())
 	s.counters[k] = v
 	return v
 }
@@ -59,6 +64,16 @@ func (s *Stats) get(providerID int64, model string) *statsValue {
 // Record logs a proxy request outcome.
 func (s *Stats) Record(providerID int64, model string, latencyMs int64, isError bool) {
 	v := s.get(providerID, model)
+
+	// Reset window if expired — prevents stale error rates from lingering forever
+	windowAge := time.Since(time.Unix(v.windowStart.Load(), 0))
+	if windowAge > statsWindowDuration {
+		v.Requests.Store(0)
+		v.Errors.Store(0)
+		v.TotalLatency.Store(0)
+		v.windowStart.Store(time.Now().Unix())
+	}
+
 	v.Requests.Add(1)
 	v.TotalLatency.Add(latencyMs)
 	if isError {
@@ -86,11 +101,4 @@ func (s *Stats) Snapshot() []StatsSnapshot {
 		out = append(out, snap)
 	}
 	return out
-}
-
-// Reset clears all counters. Called when a new check cycle completes.
-func (s *Stats) Reset() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.counters = make(map[statsKey]*statsValue)
 }

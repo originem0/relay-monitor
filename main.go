@@ -213,7 +213,20 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 		results, _ := st.GetLatestResults()
 		dbProviders, _ := st.GetProviders()
 		if len(results) > 0 {
-			p.RebuildTable(results, dbProviders, providers)
+			// Build fingerprint map for routing quality
+			fpRows, _ := st.GetLatestFingerprints()
+			var fpMap map[[2]string]proxy.FingerprintScore
+			if len(fpRows) > 0 {
+				fpMap = make(map[[2]string]proxy.FingerprintScore, len(fpRows))
+				for _, f := range fpRows {
+					fpMap[[2]string{f.ProviderName, f.Model}] = proxy.FingerprintScore{
+						TotalScore:  f.TotalScore,
+						ExpectedMin: f.ExpectedMin,
+						Verdict:     f.Verdict,
+					}
+				}
+			}
+			p.RebuildTable(results, dbProviders, providers, fpMap)
 			log.Printf("[proxy] routing table loaded: %d models", len(p.Table().Models()))
 		} else {
 			// No check data yet — trigger a warmup quick check

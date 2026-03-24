@@ -35,6 +35,9 @@ func (o ChatOptions) maxTokens() int {
 // Chat sends a single prompt and returns a normalized ChatResponse.
 // It supports both the /chat/completions and /responses API formats.
 func Chat(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, prompt string, opts ChatOptions) (*ChatResponse, error) {
+	// Per-request timeout for checker calls (proxy handles its own timeouts)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 	base := strings.TrimRight(baseURL, "/")
 	var url string
 	var payload []byte

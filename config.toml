@@ -12,7 +12,7 @@ external_url = "https://relay.sharonzhou.site"
 
 [proxy]
 enabled = true
-api_key = ""
+api_key = "sk-relay-1774294638353574284"
 request_timeout = "30s"
 stream_first_byte_timeout = "30s"
 stream_idle_timeout = "60s"
