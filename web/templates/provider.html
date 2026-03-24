@@ -69,6 +69,10 @@
             <label>备注</label>
             <input type="text" name="note" value="{{.Provider.Note}}">
         </div>
+        <div class="form-group">
+            <label>路由优先级 <span class="text-dim">(默认 1.0，设 2.0 = 优先使用，0.5 = 降权)</span></label>
+            <input type="text" name="priority" value="{{if .Provider.Priority}}{{printf "%.1f" .Provider.Priority}}{{else}}1.0{{end}}">
+        </div>
         <button type="submit" class="btn btn-primary btn-sm">保存修改</button>
     </form>
 </details>

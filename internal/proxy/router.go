@@ -44,9 +44,11 @@ type FingerprintScore struct {
 // fingerprints maps (providerName, model) to fingerprint scores for quality-based routing.
 func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []store.ProviderRow, memProviders []provider.Provider, fingerprints map[[2]string]FingerprintScore) {
 	// Build lookup maps
-	keyByName := make(map[string]string) // provider name → API key
+	keyByName := make(map[string]string)     // provider name → API key
+	priorityByName := make(map[string]float64) // provider name → priority multiplier
 	for _, p := range memProviders {
 		keyByName[p.Name] = p.APIKey
+		priorityByName[p.Name] = p.Priority
 	}
 	healthByID := make(map[int64]float64)
 	statusByID := make(map[int64]string)
@@ -90,8 +92,10 @@ func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []st
 		}
 		score := 0.4*latencyScore + 0.3*healthScore + 0.3*fpScore
 
-		// Circuit breaker is checked at Select time, not Rebuild time.
-		// This ensures providers can recover between rebuilds.
+		// Manual priority boost (default 1.0, set >1 to prioritize)
+		if pri := priorityByName[r.ProviderName]; pri > 0 {
+			score *= pri
+		}
 
 		sp := ScoredProvider{
 			ProviderID:   r.ProviderID,

@@ -122,6 +122,7 @@ type pageData struct {
 		Note     string
 		APIKey   string
 		AccessToken string
+		Priority float64
 	}
 	Models []ModelRow
 	// Models view
@@ -711,6 +712,7 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		Note     string
 		APIKey   string
 		AccessToken string
+		Priority float64
 	}{
 		Name:   dp.Name,
 		Status: dp.Status,
@@ -722,6 +724,7 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		data.Provider.Note = provMeta.Note
 		data.Provider.APIKey = provMeta.APIKey
 		data.Provider.AccessToken = provMeta.AccessToken
+		data.Provider.Priority = provMeta.Priority
 	}
 
 	// Get stored test results for this provider
@@ -1217,6 +1220,12 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 	apiKey := r.FormValue("api_key")
 	accessToken := r.FormValue("access_token")
 	note := r.FormValue("note")
+	priorityStr := r.FormValue("priority")
+
+	var priority float64
+	if priorityStr != "" {
+		fmt.Sscanf(priorityStr, "%f", &priority)
+	}
 
 	s.mu.Lock()
 	for i, p := range s.providers {
@@ -1232,6 +1241,7 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 			}
 			s.providers[i].AccessToken = accessToken
 			s.providers[i].Note = note
+			s.providers[i].Priority = priority
 			break
 		}
 	}

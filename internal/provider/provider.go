@@ -14,6 +14,7 @@ type Provider struct {
 	LastKnownQuota float64 `json:"last_known_quota,omitempty"`
 	Pinned         bool    `json:"pinned,omitempty"`
 	Note           string  `json:"note,omitempty"`
+	Priority       float64 `json:"priority,omitempty"` // routing multiplier: 0=default(1.0), 2.0=double score
 }
 
 // vendorPattern maps a keyword (matched case-insensitively) to a vendor name.
