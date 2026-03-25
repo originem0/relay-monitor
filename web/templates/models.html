@@ -89,7 +89,7 @@
                                     <td>{{if eq .ToolUse "true"}}<span class="text-ok">&#10003;</span>{{else if eq .ToolUse "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
                                     <td>{{if eq .Streaming "true"}}<span class="text-ok">&#10003;</span>{{else if eq .Streaming "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
                                     <td>
-                                        <button class="btn btn-sm" onclick="showConfig('{{.ProviderName}}', '{{.BaseURL}}', '{{.Model}}')">配置</button>
+                                        <button class="btn btn-sm" data-provider="{{.ProviderName}}" data-baseurl="{{.BaseURL}}" data-apikey="{{.APIKey}}" data-model="{{.Model}}" data-cc="{{if .CCCompat}}1{{end}}" onclick="showConfigFromBtn(this)">配置</button>
                                     </td>
                                 </tr>
                                 {{end}}
@@ -169,35 +169,56 @@ function filterModels() {
     });
 }
 
-function showConfig(provider, baseURL, model) {
+function showConfigFromBtn(btn) {
+    showConfig(
+        btn.dataset.provider,
+        btn.dataset.baseurl,
+        btn.dataset.apikey,
+        btn.dataset.model,
+        btn.dataset.cc === '1'
+    );
+}
+
+function showConfig(provider, baseURL, apiKey, model, ccCompat) {
     var modal = document.getElementById('config-modal');
     var title = document.getElementById('config-title');
     var body = document.getElementById('config-body');
     title.textContent = provider + ' / ' + model;
 
-    var configs = [
-        {
+    // Strip /v1 suffix for Anthropic SDK (it appends its own paths)
+    var anthropicBase = baseURL.replace(/\/v1\/?$/, '');
+
+    var configs = [];
+    if (ccCompat) {
+        configs.push({
             name: 'Claude Code (~/.claude/settings.json)',
             text: JSON.stringify({
-                "apiProvider": "openai-compatible",
-                "apiBaseUrl": baseURL,
-                "model": model
-            }, null, 2)
-        },
-        {
-            name: 'OpenCode (opencode.json)',
-            text: '{\n  "providers": {\n    "relay": {\n      "apiKey": "sk-xxx",\n      "baseURL": "' + baseURL + '/"\n    }\n  },\n  "models": {\n    "default": "relay/' + model + '"\n  }\n}'
-        },
-        {
-            name: 'Cursor Settings',
-            text: 'openai.apiBaseUrl = "' + baseURL + '"'
-        }
-    ];
+                "env": {
+                    "ANTHROPIC_BASE_URL": anthropicBase,
+                    "ANTHROPIC_AUTH_TOKEN": apiKey
+                }
+            }, null, 2),
+            note: '端点须支持 Anthropic API 格式 (/v1/messages)'
+        });
+        configs.push({
+            name: 'Claude Code (环境变量)',
+            text: 'export ANTHROPIC_BASE_URL="' + anthropicBase + '"\nexport ANTHROPIC_AUTH_TOKEN="' + apiKey + '"\nclaude'
+        });
+    }
+    configs.push({
+        name: 'OpenCode (opencode.json)',
+        text: '{\n  "providers": {\n    "relay": {\n      "apiKey": "' + apiKey + '",\n      "baseURL": "' + baseURL + '/"\n    }\n  },\n  "models": {\n    "default": "relay/' + model + '"\n  }\n}'
+    });
+    configs.push({
+        name: 'Codex CLI (~/.codex/config.toml)',
+        text: 'model = "' + model + '"\nmodel_provider = "relay"\n\n[model_providers.relay]\nname = "' + provider + '"\nbase_url = "' + baseURL + '"\nwire_api = "responses"\nexperimental_bearer_token = "' + apiKey + '"'
+    });
 
     var html = '';
     configs.forEach(function(c) {
         html += '<div class="config-section">';
         html += '<div class="config-label">' + c.name + '</div>';
+        if (c.note) html += '<div class="config-note">' + escapeHtml(c.note) + '</div>';
         html += '<div class="config-block"><pre>' + escapeHtml(c.text) + '</pre>';
         html += '<button class="btn btn-sm config-copy" onclick="copyText(this)">复制</button>';
         html += '</div></div>';

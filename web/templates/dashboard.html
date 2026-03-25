@@ -1,8 +1,12 @@
 {{template "layout.html" .}}
 {{define "content"}}
-<div class="provider-grid">
+<div class="search-bar">
+    <input type="text" id="provider-search" placeholder="搜索站点名称或 URL..." oninput="filterProviders(this.value)">
+    <span id="search-count" class="text-dim"></span>
+</div>
+<div class="provider-grid" id="provider-grid">
     {{range .Providers}}
-    <a href="/provider/{{.Name}}" class="provider-card{{if .Pinned}} pinned{{end}}">
+    <a href="/provider/{{.Name}}" class="provider-card{{if .Pinned}} pinned{{end}}" data-name="{{.Name}}" data-url="{{.URL}}">
         <div class="provider-card-header">
             {{if .Pinned}}<span class="pin-icon" title="已置顶">&#9733;</span>{{end}}
             <span class="status-dot status-{{.Status}}"></span>
@@ -13,7 +17,7 @@
         <div class="provider-stats">
             <span><span class="stat-value">{{.ModelsOK}}/{{.ModelsTotal}}</span> 正确</span>
             <span>延迟 <span class="stat-value">{{if .AvgLatencyMs}}{{printf "%.1f" .AvgLatencyMs}}s{{else}}-{{end}}</span></span>
-            {{if .Balance}}<span>余额 <span class="stat-value">${{printf "%.2f" (quota2usd (deref .Balance))}}</span></span>{{end}}
+            {{if .Balance}}<span>余额 <span class="stat-value">${{printf "%.2f" (quota2usd (deref .Balance))}}</span></span>{{else if .HasAccessToken}}<span class="text-err">余额获取失败</span>{{end}}
         </div>
         <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
             {{if .Note}}<span class="provider-note" style="flex:1">{{.Note}}</span>{{end}}
@@ -25,6 +29,23 @@
     </a>
     {{end}}
 </div>
+
+<script>
+function filterProviders(q) {
+    q = q.toLowerCase();
+    var cards = document.querySelectorAll('#provider-grid .provider-card');
+    var shown = 0;
+    cards.forEach(function(card) {
+        var name = (card.dataset.name || '').toLowerCase();
+        var url = (card.dataset.url || '').toLowerCase();
+        var match = !q || name.indexOf(q) !== -1 || url.indexOf(q) !== -1;
+        card.style.display = match ? '' : 'none';
+        if (match) shown++;
+    });
+    var countEl = document.getElementById('search-count');
+    countEl.textContent = q ? shown + '/' + cards.length : '';
+}
+</script>
 
 {{if .Events}}
 <div class="mt-2">

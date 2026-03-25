@@ -240,6 +240,29 @@ func (s *Store) RenameProvider(id int64, newName string) error {
 	return err
 }
 
+// DeleteProvider removes a provider and all its associated data.
+func (s *Store) DeleteProvider(id int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`DELETE FROM check_results WHERE provider_id = ?`,
+		`DELETE FROM fingerprint_results WHERE provider_id = ?`,
+		`DELETE FROM capabilities WHERE provider_id = ?`,
+		`DELETE FROM events WHERE provider = (SELECT name FROM providers WHERE id = ?)`,
+		`DELETE FROM providers WHERE id = ?`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt, id); err != nil {
+			return fmt.Errorf("delete provider %d: %w", id, err)
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) UpdateProviderPlatform(id int64, platform string) error {
 	_, err := s.db.Exec(`UPDATE providers SET platform = ?, updated_at = datetime('now') WHERE id = ?`, platform, id)
 	return err

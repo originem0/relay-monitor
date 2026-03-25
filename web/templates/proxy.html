@@ -48,34 +48,6 @@
     </div>
 </div>
 
-{{if .ModelCatalog}}
-<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">可用模型</h3>
-<div class="table-wrap" style="margin-bottom:24px">
-    <table>
-        <thead>
-            <tr>
-                <th>模型</th>
-                <th>厂商</th>
-                <th>Provider 数</th>
-                <th>最佳延迟</th>
-                <th>最佳 Provider</th>
-            </tr>
-        </thead>
-        <tbody>
-            {{range .ModelCatalog}}
-            <tr>
-                <td><code>{{.Model}}</code></td>
-                <td>{{.Vendor}}</td>
-                <td>{{.Providers}}</td>
-                <td style="font-family:var(--mono)">{{printf "%.2f" (divf .BestLatency 1000.0)}}s</td>
-                <td>{{.BestProvider}}</td>
-            </tr>
-            {{end}}
-        </tbody>
-    </table>
-</div>
-{{end}}
-
 {{if .ProxyModels}}
 <h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">模型流量</h3>
 <div class="table-wrap" style="margin-bottom:24px">
@@ -104,7 +76,7 @@
 
 {{if .ProxyProviders}}
 <h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">Provider 路由</h3>
-<div class="table-wrap">
+<div class="table-wrap" style="margin-bottom:24px">
     <table>
         <thead>
             <tr>
@@ -131,6 +103,34 @@
 {{if and (not .ProxyModels) (not .ProxyWarming)}}
 <div class="card" style="padding:32px;text-align:center;color:var(--text-dim)">
     <p>暂无代理请求数据。使用上方的 Endpoint 和 API Key 发送请求。</p>
+</div>
+{{end}}
+
+{{if .ModelCatalog}}
+<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">可用模型</h3>
+<div class="table-wrap" style="margin-bottom:24px">
+    <table>
+        <thead>
+            <tr>
+                <th>模型</th>
+                <th>厂商</th>
+                <th>Provider 数</th>
+                <th>最佳延迟</th>
+                <th>最佳 Provider</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .ModelCatalog}}
+            <tr>
+                <td><code>{{.Model}}</code></td>
+                <td>{{.Vendor}}</td>
+                <td>{{.Providers}}</td>
+                <td style="font-family:var(--mono)">{{printf "%.2f" (divf .BestLatency 1000.0)}}s</td>
+                <td>{{.BestProvider}}</td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
 </div>
 {{end}}
 

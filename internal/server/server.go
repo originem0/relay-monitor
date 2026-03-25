@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"html/template"
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +24,49 @@ import (
 	"relay-monitor/internal/store"
 	"relay-monitor/web"
 )
+
+func isValidProviderName(name string) bool {
+	if name == "" || len(name) > 100 {
+		return false
+	}
+	for _, r := range name {
+		switch r {
+		case '<', '>', '"', '\'', '\\', '`':
+			return false
+		}
+	}
+	return true
+}
+
+// isClaudeModel returns true if the model name is an Anthropic Claude model.
+func isClaudeModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(model), "claude")
+}
+
+func csrfHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete {
+			check := r.Header.Get("Origin")
+			if check == "" {
+				check = r.Header.Get("Referer")
+			}
+			if check != "" {
+				checkHost := check
+				if i := strings.Index(check, "://"); i >= 0 {
+					checkHost = check[i+3:]
+				}
+				if j := strings.Index(checkHost, "/"); j >= 0 {
+					checkHost = checkHost[:j]
+				}
+				if checkHost != r.Host {
+					http.Error(w, "CSRF check failed", http.StatusForbidden)
+					return
+				}
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
 
 // Server is the HTTP dashboard server.
 type Server struct {
@@ -43,17 +88,19 @@ type Server struct {
 
 // ProviderCard is the view model for a dashboard card.
 type ProviderCard struct {
-	Name         string
-	Status       string
-	Platform     string
-	ModelsOK     int
-	ModelsTotal  int
-	AvgLatencyMs float64
-	Health       int
-	Balance      *float64
-	Pinned       bool
-	Note         string
-	ErrorMsg     string
+	Name           string
+	Status         string
+	Platform       string
+	URL            string
+	ModelsOK       int
+	ModelsTotal    int
+	AvgLatencyMs   float64
+	Health         int
+	Balance        *float64
+	HasAccessToken bool
+	Pinned         bool
+	Note           string
+	ErrorMsg       string
 }
 
 // EventItem is the view model for an event in the list.
@@ -93,6 +140,7 @@ type ModelGroup struct {
 type ModelProviderRow struct {
 	ProviderName string
 	BaseURL      string
+	APIKey       string
 	Model        string
 	LatencyMs    int64
 	Correct      bool
@@ -102,6 +150,7 @@ type ModelProviderRow struct {
 	ToolUse      string // "true", "false", ""
 	Streaming    string
 	IsBest       bool
+	CCCompat     bool // Claude Code compatible: claude model + tool_use + streaming
 }
 
 type pageData struct {
@@ -233,7 +282,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.httpSrv = &http.Server{
 		Addr:    s.cfg.Listen,
-		Handler: mux,
+		Handler: csrfHandler(mux),
 	}
 
 	go func() {
@@ -485,6 +534,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			Name:     dp.Name,
 			Status:   dp.Status,
 			Platform: dp.Platform,
+			URL:      dp.BaseURL,
 			Health:   int(dp.Health),
 			Balance:  dp.LastBalance,
 			ErrorMsg: dp.LastError,
@@ -492,6 +542,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		if meta, ok := provMeta[dp.Name]; ok {
 			card.Pinned = meta.Pinned
 			card.Note = meta.Note
+			card.HasAccessToken = meta.AccessToken != ""
 		}
 		if results, ok := provResults[dp.ID]; ok {
 			card.ModelsTotal = len(results)
@@ -559,8 +610,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		provIDByName[dp.Name] = dp.ID
 	}
 	provBaseURL := make(map[string]string)
+	provAPIKey := make(map[string]string)
 	for _, p := range s.providers {
 		provBaseURL[p.Name] = p.BaseURL
+		provAPIKey[p.Name] = p.APIKey
 	}
 
 	// Group results by model
@@ -569,6 +622,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		providerID   int64
 		providerName string
 		baseURL      string
+		apiKey       string
 		latencyMs    int64
 		correct      bool
 		status       string
@@ -590,6 +644,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			providerID:   cr.ProviderID,
 			providerName: info[0],
 			baseURL:      baseURL,
+			apiKey:       provAPIKey[info[0]],
 			latencyMs:    cr.LatencyMs,
 			correct:      cr.Correct,
 			status:       cr.Status,
@@ -634,6 +689,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			row := ModelProviderRow{
 				ProviderName: pr.providerName,
 				BaseURL:      pr.baseURL,
+				APIKey:       pr.apiKey,
 				Model:        k.model,
 				LatencyMs:    pr.latencyMs,
 				Correct:      pr.correct,
@@ -644,7 +700,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 				if cap, ok := caps[k.model]; ok {
 					row.ToolUse = boolStr(cap.ToolUse)
 					row.Streaming = boolStr(cap.Streaming)
-					if cap.ToolUse != nil && *cap.ToolUse && cap.Streaming != nil && *cap.Streaming {
+					if cap.ToolUse != nil && *cap.ToolUse && cap.Streaming != nil && *cap.Streaming && isClaudeModel(k.model) {
+						row.CCCompat = true
 						anyCC = true
 					}
 				}
@@ -877,12 +934,12 @@ func (s *Server) handleTriggerSingleCheck(w http.ResponseWriter, r *http.Request
 
 	// Return result directly as HTML feedback
 	if errMsg != "" {
-		fmt.Fprintf(w, `<span style="color:var(--down)">%s: %s</span>`, name, errMsg)
+		fmt.Fprintf(w, `<span style="color:var(--down)">%s: %s</span>`, html.EscapeString(name), html.EscapeString(errMsg))
 	} else if len(pr.Results) == 0 {
-		fmt.Fprintf(w, `<span style="color:var(--down)">%s: 无可用模型</span>`, name)
+		fmt.Fprintf(w, `<span style="color:var(--down)">%s: 无可用模型</span>`, html.EscapeString(name))
 	} else {
 		fmt.Fprintf(w, `<span style="color:var(--ok)">%s: %d/%d 正确 — <a href="/provider/%s" style="color:var(--accent)">查看详情</a></span>`,
-			name, correct, len(pr.Results), name)
+			html.EscapeString(name), correct, len(pr.Results), url.PathEscape(name))
 	}
 }
 
@@ -1003,12 +1060,16 @@ func (s *Server) RunFingerprintAndStore(ctx context.Context, provs []provider.Pr
 	logFn := func(msg string) {
 		ts := time.Now().Format("15:04:05")
 		log.Printf("[%s] %s", ts, msg)
+		s.sseHub.Publish(SSEEvent{Type: "check_progress", Data: msg})
 	}
 
-	for _, p := range provs {
+	s.sseHub.Publish(SSEEvent{Type: "check_started", Data: fmt.Sprintf("指纹检测 %d 个站点", len(provs))})
+
+	for i, p := range provs {
 		if ctx.Err() != nil {
 			break
 		}
+		s.sseHub.Publish(SSEEvent{Type: "check_progress", Data: fmt.Sprintf("[%d/%d] %s 指纹检测中...", i+1, len(provs), p.Name)})
 		results := s.engine.RunFingerprintAll(ctx, s.engine.Client, p, logFn)
 		pid, ok := provIDs[p.Name]
 		if !ok {
@@ -1025,6 +1086,7 @@ func (s *Server) RunFingerprintAndStore(ctx context.Context, provs []provider.Pr
 				fr.ExpectedTier, fr.ExpectedMin, fr.Verdict,
 				fr.SelfID.Verdict, fr.SelfID.Detail, string(answersJSON))
 		}
+		s.sseHub.Publish(SSEEvent{Type: "provider_done", Data: fmt.Sprintf("%s 指纹完成 (%d 模型)", p.Name, len(results))})
 	}
 
 	// Rebuild proxy routing table with updated fingerprint scores
@@ -1112,11 +1174,23 @@ func (s *Server) handleAddProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !isValidProviderName(name) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `<div class="result-error">站名包含非法字符</div>`)
+		return
+	}
+
+	if u, err := url.Parse(baseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `<div class="result-error">URL 格式无效，需以 http:// 或 https:// 开头</div>`)
+		return
+	}
+
 	// Check for duplicate hostname
 	for _, p := range s.providers {
 		if config.SameHost(p.BaseURL, baseURL) {
 			w.WriteHeader(http.StatusConflict)
-			fmt.Fprintf(w, `<div class="result-error">与已有站点 "%s" 重复（相同域名）</div>`, p.Name)
+			fmt.Fprintf(w, `<div class="result-error">与已有站点 "%s" 重复（相同域名）</div>`, html.EscapeString(p.Name))
 			return
 		}
 	}
@@ -1138,7 +1212,7 @@ func (s *Server) handleAddProvider(w http.ResponseWriter, r *http.Request) {
 
 	if saveErr := config.SaveProviders(s.cfg.ProvidersFile, provs); saveErr != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, `<div class="result-error">保存失败: %s</div>`, saveErr)
+		fmt.Fprintf(w, `<div class="result-error">保存失败: %s</div>`, html.EscapeString(saveErr.Error()))
 		return
 	}
 
@@ -1150,7 +1224,7 @@ func (s *Server) handleAddProvider(w http.ResponseWriter, r *http.Request) {
 		msg += fmt.Sprintf(" (连接验证失败: %s, 但已保存)", err)
 	}
 
-	fmt.Fprintf(w, `<div class="result-success">%s <a href="/">返回总览</a></div>`, msg)
+	fmt.Fprintf(w, `<div class="result-success">%s <a href="/">返回总览</a></div>`, html.EscapeString(msg))
 
 	// Trigger initial check in background
 	go s.RunCheckAndStore(context.Background(), []provider.Provider{newProv}, "manual", checker.ModeFull)
@@ -1159,7 +1233,11 @@ func (s *Server) handleAddProvider(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 
+	// Hold lock across both DB and in-memory deletion
 	s.mu.Lock()
+	if dp, _ := s.store.GetProviderByName(name); dp != nil {
+		s.store.DeleteProvider(dp.ID)
+	}
 	var remaining []provider.Provider
 	for _, p := range s.providers {
 		if p.Name != name {
@@ -1189,7 +1267,7 @@ func (s *Server) handleTogglePin(w http.ResponseWriter, r *http.Request) {
 	copy(provs, s.providers)
 	s.mu.Unlock()
 	config.SaveProviders(s.cfg.ProvidersFile, provs)
-	w.Header().Set("HX-Redirect", "/provider/"+name)
+	w.Header().Set("HX-Redirect", "/provider/"+url.PathEscape(name))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -1208,7 +1286,7 @@ func (s *Server) handleUpdateNote(w http.ResponseWriter, r *http.Request) {
 	copy(provs, s.providers)
 	s.mu.Unlock()
 	config.SaveProviders(s.cfg.ProvidersFile, provs)
-	w.Header().Set("HX-Redirect", "/provider/"+name)
+	w.Header().Set("HX-Redirect", "/provider/"+url.PathEscape(name))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -1227,7 +1305,29 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(priorityStr, "%f", &priority)
 	}
 
+	if newName != "" && !isValidProviderName(newName) {
+		http.Error(w, "invalid name", http.StatusBadRequest)
+		return
+	}
+	if baseURL != "" {
+		if u, err := url.Parse(baseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			http.Error(w, "invalid base_url", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Hold lock across both DB and in-memory updates to avoid TOCTOU
 	s.mu.Lock()
+	effectiveName := name
+	if dp, err := s.store.GetProviderByName(name); err == nil && dp != nil {
+		if newName != "" && newName != name {
+			s.store.RenameProvider(dp.ID, newName)
+			effectiveName = newName
+		}
+		if baseURL != "" {
+			s.store.UpsertProvider(effectiveName, baseURL, dp.APIFormat, dp.Platform)
+		}
+	}
 	for i, p := range s.providers {
 		if p.Name == name {
 			if newName != "" {
@@ -1250,19 +1350,7 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	config.SaveProviders(s.cfg.ProvidersFile, provs)
 
-	// Update DB provider name so store stays in sync
-	if newName != "" && newName != name {
-		dp, err := s.store.GetProviderByName(name)
-		if err == nil && dp != nil {
-			s.store.RenameProvider(dp.ID, newName)
-		}
-	}
-
-	redirect := "/provider/" + name
-	if newName != "" && newName != name {
-		redirect = "/provider/" + newName
-	}
-	w.Header().Set("HX-Redirect", redirect)
+	w.Header().Set("HX-Redirect", "/provider/"+url.PathEscape(effectiveName))
 	w.WriteHeader(http.StatusOK)
 }
 

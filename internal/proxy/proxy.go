@@ -176,8 +176,24 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 		candidate := candidates[attempt]
 		start := time.Now()
 
+		// Shrink timeout on retries: full → ÷2 → ÷4
+		retryCfg := cfg
+		if attempt > 0 {
+			divisor := time.Duration(2 * attempt) // attempt 1→÷2, attempt 2→÷4
+			shorter := *cfg
+			shorter.RequestTimeout.Duration = cfg.RequestTimeout.Duration / divisor
+			shorter.StreamFirstByteTimeout.Duration = cfg.StreamFirstByteTimeout.Duration / divisor
+			if shorter.RequestTimeout.Duration < 5*time.Second {
+				shorter.RequestTimeout.Duration = 5 * time.Second
+			}
+			if shorter.StreamFirstByteTimeout.Duration < 5*time.Second {
+				shorter.StreamFirstByteTimeout.Duration = 5 * time.Second
+			}
+			retryCfg = &shorter
+		}
+
 		upstreamURL := strings.TrimRight(candidate.BaseURL, "/") + pathSuffix
-		result, done := p.forwardOne(r.Context(), cfg, upstreamURL, candidate.APIKey, body, req.Stream, w, r)
+		result, done := p.forwardOne(r.Context(), retryCfg, upstreamURL, candidate.APIKey, body, req.Stream, w, r)
 		elapsed := time.Since(start).Milliseconds()
 
 		if result == forwardOK {
@@ -239,6 +255,7 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 
 	resp, err := p.client.Do(upstream)
 	if err != nil {
+		log.Printf("[proxy] upstream connect error: %s: %v", url, err)
 		return forwardRetry, false
 	}
 
@@ -246,21 +263,24 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 	if resp.StatusCode >= 500 || resp.StatusCode == 429 {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+		log.Printf("[proxy] upstream %d from %s", resp.StatusCode, url)
 		return forwardRetry, false
 	}
 
-	// 403 (quota exhausted): retry but don't trigger circuit breaker
-	if resp.StatusCode == 403 {
+	// 401 (auth failed), 403 (quota exhausted), 404 (model gone):
+	// upstream-side issues, retry on next provider without triggering breaker
+	if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+		log.Printf("[proxy] upstream %d from %s, will retry next provider", resp.StatusCode, url)
 		return forwardRetryMild, false
 	}
 
-	// Other 4xx: client error, don't retry, forward as-is
+	// Other 4xx: client error (bad request body etc), don't retry, forward as-is
 	if resp.StatusCode >= 400 {
 		copyResponse(w, resp)
 		resp.Body.Close()
-		return forwardRetry, true // done=true because we wrote the response
+		return forwardRetryMild, true // done=true because we wrote the response
 	}
 
 	if !stream || resp.StatusCode != 200 {
@@ -296,12 +316,13 @@ func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *conf
 	idle := time.NewTimer(cfg.StreamIdleTimeout.Duration)
 	defer idle.Stop()
 
-	done := make(chan error, 1)
+	var timedOut atomic.Bool
+	done := make(chan forwardResult, 1)
 	go func() {
 		for scanner.Scan() {
 			line := scanner.Text()
 			if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
-				done <- err
+				done <- forwardDone
 				return
 			}
 			if line == "" { // SSE event boundary
@@ -309,26 +330,32 @@ func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *conf
 			}
 			idle.Reset(cfg.StreamIdleTimeout.Duration)
 			if strings.HasPrefix(line, "data: [DONE]") {
-				done <- nil
+				done <- forwardOK
 				return
 			}
 		}
-		done <- scanner.Err()
+		// Scanner loop ended — either timeout-induced body close or natural EOF
+		if timedOut.Load() {
+			fmt.Fprintf(w, "data: {\"error\":{\"message\":\"upstream timeout\"}}\n\ndata: [DONE]\n\n")
+			flusher.Flush()
+			done <- forwardDone
+			return
+		}
+		if scanner.Err() != nil {
+			done <- forwardDone
+			return
+		}
+		done <- forwardOK
 	}()
 
 	select {
-	case err := <-done:
-		if err != nil {
-			return forwardDone
-		}
-		return forwardOK
+	case result := <-done:
+		return result
 	case <-idle.C:
-		// Upstream went silent mid-stream; close body to unblock scanner goroutine
+		// Upstream went silent mid-stream; signal timeout and close body to unblock scanner
+		timedOut.Store(true)
 		resp.Body.Close()
-		fmt.Fprintf(w, "data: {\"error\":{\"message\":\"upstream timeout\"}}\n\ndata: [DONE]\n\n")
-		flusher.Flush()
-		<-done // wait for goroutine to exit
-		return forwardDone
+		return <-done
 	}
 }
 

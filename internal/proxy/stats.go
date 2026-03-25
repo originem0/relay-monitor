@@ -66,12 +66,14 @@ func (s *Stats) Record(providerID int64, model string, latencyMs int64, isError 
 	v := s.get(providerID, model)
 
 	// Reset window if expired — prevents stale error rates from lingering forever
-	windowAge := time.Since(time.Unix(v.windowStart.Load(), 0))
-	if windowAge > statsWindowDuration {
-		v.Requests.Store(0)
-		v.Errors.Store(0)
-		v.TotalLatency.Store(0)
-		v.windowStart.Store(time.Now().Unix())
+	oldStart := v.windowStart.Load()
+	if time.Since(time.Unix(oldStart, 0)) > statsWindowDuration {
+		newStart := time.Now().Unix()
+		if v.windowStart.CompareAndSwap(oldStart, newStart) {
+			v.Requests.Store(0)
+			v.Errors.Store(0)
+			v.TotalLatency.Store(0)
+		}
 	}
 
 	v.Requests.Add(1)

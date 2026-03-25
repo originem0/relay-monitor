@@ -153,9 +153,9 @@ func TestSelectFormatFiltering(t *testing.T) {
 	if c := rt.Select("m1", "chat", nil, nil); len(c) != 1 {
 		t.Errorf("chat format: got %d, want 1", len(c))
 	}
-	// Chat provider should also serve responses format
-	if c := rt.Select("m1", "responses", nil, nil); len(c) != 1 {
-		t.Errorf("responses format: got %v, want 1 (chat providers serve both formats)", len(c))
+	// Chat-only provider must NOT serve responses format (would cause 404)
+	if c := rt.Select("m1", "responses", nil, nil); len(c) != 0 {
+		t.Errorf("responses format: got %d, want 0 (chat-only providers should not serve responses)", len(c))
 	}
 }
 

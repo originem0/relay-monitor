@@ -207,6 +207,28 @@ a:hover {
     font-size: 0.78rem;
 }
 
+/* ── Search bar ── */
+.search-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+}
+.search-bar input {
+    flex: 1;
+    max-width: 400px;
+    padding: 7px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card);
+    color: var(--text);
+    font-size: 0.85rem;
+    outline: none;
+}
+.search-bar input:focus {
+    border-color: var(--accent);
+}
+
 /* ── Provider grid ── */
 .provider-grid {
     display: grid;
@@ -760,6 +782,11 @@ code {
     color: var(--text-dim);
     margin-bottom: 6px;
     font-weight: 600;
+}
+.config-note {
+    font-size: 0.72rem;
+    color: var(--yellow, #e0a526);
+    margin-bottom: 6px;
 }
 
 .config-block {

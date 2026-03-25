@@ -80,3 +80,5 @@ CREATE TABLE IF NOT EXISTS events (
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_events_unread ON events(read, created_at);
+CREATE INDEX IF NOT EXISTS idx_fp_prov_model ON fingerprint_results(provider_id, model, checked_at);
+CREATE INDEX IF NOT EXISTS idx_events_provider ON events(provider);

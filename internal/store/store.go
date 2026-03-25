@@ -24,7 +24,7 @@ func New(dbPath string) (*Store, error) {
 		os.MkdirAll(dir, 0755)
 	}
 
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

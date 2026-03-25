@@ -60,12 +60,11 @@
 
 <script>
 (function() {
-    var es = new EventSource('/api/v1/sse');
-    var reloadTimer = null;
     var panel = document.getElementById('task-panel');
     var taskLog = document.getElementById('task-log');
     var taskSummary = document.getElementById('task-summary');
     var statusText = document.getElementById('status-text');
+    var reloadTimer = null;
 
     // Highlight active nav link
     var path = location.pathname;
@@ -77,35 +76,47 @@
         }
     });
 
-    es.addEventListener('check_started', function(e) {
-        panel.style.display = 'block';
-        taskLog.innerHTML = '';
-        taskSummary.textContent = e.data;
-        statusText.innerHTML = '<span style="color:var(--accent)">&#9678; 检测中... ' + e.data + '</span>';
-    });
+    function escapeSSE(s) {
+        var d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
+    }
 
-    es.addEventListener('check_progress', function(e) {
-        panel.style.display = 'block';
-        var line = document.createElement('div');
-        line.textContent = e.data;
-        taskLog.appendChild(line);
-        taskLog.scrollTop = taskLog.scrollHeight;
-    });
+    function connectSSE() {
+        var es = new EventSource('/api/v1/sse');
 
-    es.addEventListener('provider_done', function(e) {
-        statusText.innerHTML = '<span style="color:var(--accent)">&#9678; 检测中... ' + e.data + ' 完成</span>';
-    });
+        es.addEventListener('check_started', function(e) {
+            panel.style.display = 'block';
+            taskLog.innerHTML = '';
+            taskSummary.textContent = e.data;
+            statusText.innerHTML = '<span style="color:var(--accent)">&#9678; 检测中... ' + escapeSSE(e.data) + '</span>';
+        });
 
-    es.addEventListener('check_completed', function(e) {
-        panel.style.display = 'none';
-        if (reloadTimer) clearTimeout(reloadTimer);
-        reloadTimer = setTimeout(function() { location.reload(); }, 500);
-    });
+        es.addEventListener('check_progress', function(e) {
+            panel.style.display = 'block';
+            var line = document.createElement('div');
+            line.textContent = e.data;
+            taskLog.appendChild(line);
+            taskLog.scrollTop = taskLog.scrollHeight;
+        });
 
-    es.onerror = function() {
-        es.close();
-        setTimeout(function() { es = new EventSource('/api/v1/sse'); }, 5000);
-    };
+        es.addEventListener('provider_done', function(e) {
+            statusText.innerHTML = '<span style="color:var(--accent)">&#9678; 检测中... ' + escapeSSE(e.data) + ' 完成</span>';
+        });
+
+        es.addEventListener('check_completed', function(e) {
+            panel.style.display = 'none';
+            if (reloadTimer) clearTimeout(reloadTimer);
+            reloadTimer = setTimeout(function() { location.reload(); }, 500);
+        });
+
+        es.onerror = function() {
+            es.close();
+            setTimeout(connectSSE, 5000);
+        };
+    }
+
+    connectSSE();
 })();
 </script>
 </body>

@@ -295,10 +295,10 @@ func matchFormat(providerFormat, requestFormat string) bool {
 	if providerFormat == "" {
 		providerFormat = "chat"
 	}
-	// Most OpenAI-compatible providers support both formats.
-	// Only reject if provider is exclusively "responses" and request is "chat",
-	// since responses-only providers lack /chat/completions endpoint.
 	if requestFormat == "chat" && providerFormat == "responses" {
+		return false
+	}
+	if requestFormat == "responses" && providerFormat == "chat" {
 		return false
 	}
 	return true
