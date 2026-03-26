@@ -295,10 +295,10 @@ func matchFormat(providerFormat, requestFormat string) bool {
 	if providerFormat == "" {
 		providerFormat = "chat"
 	}
+	// Only reject: chat request to a responses-only provider (no /chat/completions endpoint).
+	// All other combos are allowed — most providers support both formats,
+	// and failover handles the rare 404 from providers that don't.
 	if requestFormat == "chat" && providerFormat == "responses" {
-		return false
-	}
-	if requestFormat == "responses" && providerFormat == "chat" {
 		return false
 	}
 	return true
@@ -324,4 +324,14 @@ func clamp(v, min, max float64) float64 {
 		return max
 	}
 	return v
+}
+
+// DebugScores returns the raw scored providers for a given model, sorted by score desc.
+func (rt *RoutingTable) DebugScores(model string) []ScoredProvider {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	src := rt.models[model]
+	out := make([]ScoredProvider, len(src))
+	copy(out, src)
+	return out
 }

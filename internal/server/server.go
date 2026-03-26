@@ -449,8 +449,8 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 				s.store.UpdateProviderPlatform(pid, platform)
 			}
 		}
-		if prov.AccessToken != "" {
-			bi, berr := checker.QueryBalance(ctx, s.engine.Client, prov.BaseURL, prov.AccessToken)
+		if prov.AccessToken != "" || prov.APIKey != "" {
+			bi, berr := checker.QueryBalance(ctx, s.engine.Client, prov.BaseURL, prov.AccessToken, prov.APIKey)
 			if berr != nil {
 				log.Printf("[balance] %s: error: %v", pr.Provider, berr)
 			} else if bi != nil {
@@ -1186,8 +1186,13 @@ func (s *Server) handleAddProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check for duplicate hostname
+	// Check for duplicate name or hostname
 	for _, p := range s.providers {
+		if p.Name == name {
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprintf(w, `<div class="result-error">站名 "%s" 已存在</div>`, html.EscapeString(name))
+			return
+		}
 		if config.SameHost(p.BaseURL, baseURL) {
 			w.WriteHeader(http.StatusConflict)
 			fmt.Fprintf(w, `<div class="result-error">与已有站点 "%s" 重复（相同域名）</div>`, html.EscapeString(p.Name))
@@ -1248,6 +1253,13 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	config.SaveProviders(s.cfg.ProvidersFile, remaining)
+
+	// Rebuild proxy routing table to remove deleted provider
+	if s.proxy != nil {
+		results, _ := s.store.GetLatestResults()
+		dbProviders, _ := s.store.GetProviders()
+		s.proxy.RebuildTable(results, dbProviders, remaining, s.buildFingerprintMap())
+	}
 
 	// Redirect to dashboard
 	w.Header().Set("HX-Redirect", "/")
@@ -1349,6 +1361,13 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 	copy(provs, s.providers)
 	s.mu.Unlock()
 	config.SaveProviders(s.cfg.ProvidersFile, provs)
+
+	// Rebuild proxy routing table immediately so priority changes take effect
+	if s.proxy != nil {
+		results, _ := s.store.GetLatestResults()
+		dbProviders, _ := s.store.GetProviders()
+		s.proxy.RebuildTable(results, dbProviders, provs, s.buildFingerprintMap())
+	}
 
 	w.Header().Set("HX-Redirect", "/provider/"+url.PathEscape(effectiveName))
 	w.WriteHeader(http.StatusOK)
@@ -1483,6 +1502,24 @@ func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 	if s.proxy == nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"enabled": false})
+		return
+	}
+
+	// ?debug=model_name returns detailed routing scores
+	if debugModel := r.URL.Query().Get("debug"); debugModel != "" {
+		scores := s.proxy.Table().DebugScores(debugModel)
+		type entry struct {
+			Provider  string  `json:"provider"`
+			Score     float64 `json:"score"`
+			LatencyMs int64   `json:"latency_ms"`
+			Format    string  `json:"format"`
+		}
+		out := make([]entry, len(scores))
+		for i, sp := range scores {
+			out[i] = entry{sp.ProviderName, sp.Score, sp.LatencyMs, sp.APIFormat}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(out)
 		return
 	}
 
