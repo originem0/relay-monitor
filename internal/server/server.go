@@ -449,8 +449,8 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 				s.store.UpdateProviderPlatform(pid, platform)
 			}
 		}
-		if prov.AccessToken != "" || prov.APIKey != "" {
-			bi, berr := checker.QueryBalance(ctx, s.engine.Client, prov.BaseURL, prov.AccessToken, prov.APIKey)
+		if prov.AccessToken != "" {
+			bi, berr := checker.QueryBalance(ctx, s.engine.Client, prov.BaseURL, prov.AccessToken)
 			if berr != nil {
 				log.Printf("[balance] %s: error: %v", pr.Provider, berr)
 			} else if bi != nil {

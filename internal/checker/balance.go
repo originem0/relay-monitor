@@ -81,34 +81,19 @@ func DetectPlatform(ctx context.Context, client *http.Client, baseURL string) st
 	return "unknown"
 }
 
-// QueryBalance queries the remaining quota from a new-api/one-api panel.
-// Tries /api/user/self first (needs access_token), then falls back to
-// /v1/dashboard/billing/* (works with API key on most new-api forks).
-func QueryBalance(ctx context.Context, client *http.Client, baseURL, accessToken, apiKey string) (*BalanceInfo, error) {
+// QueryBalance queries the remaining quota from a new-api/one-api panel
+// via /api/user/self. Returns nil if accessToken is empty or the query fails.
+func QueryBalance(ctx context.Context, client *http.Client, baseURL, accessToken string) (*BalanceInfo, error) {
+	if accessToken == "" {
+		return nil, nil
+	}
+
 	root := panelRoot(baseURL)
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// Method 1: /api/user/self with access_token (classic new-api/one-api)
-	if accessToken != "" {
-		bi, err := queryBalanceUserSelf(ctx, client, root, accessToken)
-		if bi != nil {
-			return bi, nil
-		}
-		_ = err // fall through to method 2
-	}
-
-	// Method 2: /v1/dashboard/billing/* with API key (OpenAI-compatible billing)
-	if apiKey != "" {
-		bi, err := queryBalanceBilling(ctx, client, baseURL, apiKey)
-		if bi != nil {
-			return bi, nil
-		}
-		return nil, err
-	}
-
-	return nil, nil
+	return queryBalanceUserSelf(ctx, client, root, accessToken)
 }
 
 func queryBalanceUserSelf(ctx context.Context, client *http.Client, root, accessToken string) (*BalanceInfo, error) {
@@ -152,73 +137,5 @@ func queryBalanceUserSelf(ctx context.Context, client *http.Client, root, access
 	return &BalanceInfo{
 		Remaining: result.Data.Quota,
 		Used:      result.Data.UsedQuota,
-	}, nil
-}
-
-func queryBalanceBilling(ctx context.Context, client *http.Client, baseURL, accessToken string) (*BalanceInfo, error) {
-	base := strings.TrimRight(baseURL, "/")
-	if !strings.HasSuffix(base, "/v1") {
-		base += "/v1"
-	}
-
-	// Use accessToken as Bearer auth for billing endpoint
-	auth := accessToken
-
-	subReq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/dashboard/billing/subscription", nil)
-	if err != nil {
-		return nil, err
-	}
-	subReq.Header.Set("Authorization", "Bearer "+auth)
-	subReq.Header.Set("User-Agent", UserAgent)
-
-	subResp, err := client.Do(subReq)
-	if err != nil {
-		return nil, err
-	}
-	defer subResp.Body.Close()
-
-	if subResp.StatusCode != 200 {
-		io.ReadAll(subResp.Body)
-		return nil, nil
-	}
-
-	var sub struct {
-		HardLimitUSD float64 `json:"hard_limit_usd"`
-	}
-	body, _ := io.ReadAll(subResp.Body)
-	if json.Unmarshal(body, &sub) != nil || sub.HardLimitUSD <= 0 {
-		return nil, nil
-	}
-
-	// Query usage for current month
-	now := time.Now()
-	startDate := now.Format("2006-01-01")
-	endDate := now.AddDate(0, 1, 0).Format("2006-01-02")
-
-	usageReq, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		base+"/dashboard/billing/usage?start_date="+startDate+"&end_date="+endDate, nil)
-	if err != nil {
-		return nil, err
-	}
-	usageReq.Header.Set("Authorization", "Bearer "+auth)
-	usageReq.Header.Set("User-Agent", UserAgent)
-
-	usageResp, err := client.Do(usageReq)
-	if err != nil {
-		return nil, err
-	}
-	defer usageResp.Body.Close()
-
-	var usage struct {
-		TotalUsage float64 `json:"total_usage"`
-	}
-	body2, _ := io.ReadAll(usageResp.Body)
-	if json.Unmarshal(body2, &usage) != nil {
-		return nil, nil
-	}
-
-	return &BalanceInfo{
-		Remaining: sub.HardLimitUSD - usage.TotalUsage,
-		Used:      usage.TotalUsage,
 	}, nil
 }
