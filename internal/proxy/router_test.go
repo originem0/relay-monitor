@@ -30,9 +30,9 @@ func TestRebuildAndSelectBasic(t *testing.T) {
 	rt := NewRoutingTable()
 	results, dbProviders, memProviders := makeTestData()
 
-	rt.Rebuild(results, dbProviders, memProviders, nil)
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
-	candidates := rt.Select("gpt-5", "chat", nil, nil)
+	candidates := rt.Select("gpt-5", "chat", RequestRequirements{}, nil, nil)
 	if len(candidates) == 0 {
 		t.Fatal("Select returned no candidates")
 	}
@@ -56,9 +56,9 @@ func TestRebuildFiltersIncorrect(t *testing.T) {
 		{Name: "bad", APIKey: "k2"},
 	}
 
-	rt.Rebuild(results, dbProviders, memProviders, nil)
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
-	candidates := rt.Select("m1", "chat", nil, nil)
+	candidates := rt.Select("m1", "chat", RequestRequirements{}, nil, nil)
 	if len(candidates) != 1 {
 		t.Fatalf("got %d candidates, want 1 (incorrect filtered)", len(candidates))
 	}
@@ -82,9 +82,9 @@ func TestRebuildFiltersDownProvider(t *testing.T) {
 		{Name: "down", APIKey: "k2"},
 	}
 
-	rt.Rebuild(results, dbProviders, memProviders, nil)
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
-	candidates := rt.Select("m1", "chat", nil, nil)
+	candidates := rt.Select("m1", "chat", RequestRequirements{}, nil, nil)
 	if len(candidates) != 1 {
 		t.Fatalf("got %d candidates, want 1 (down provider filtered)", len(candidates))
 	}
@@ -109,7 +109,7 @@ func TestRebuildFingerprintPenalty(t *testing.T) {
 		{"fake", "m1"}:    {TotalScore: 2, ExpectedMin: 9, Verdict: "LIKELY FAKE"},
 	}
 
-	rt.Rebuild(results, dbProviders, memProviders, fps)
+	rt.Rebuild(results, dbProviders, memProviders, fps, nil)
 
 	// Check raw scores: genuine should have higher score than fake
 	rt.mu.RLock()
@@ -130,7 +130,7 @@ func TestRebuildFingerprintPenalty(t *testing.T) {
 
 func TestSelectUnknownModel(t *testing.T) {
 	rt := NewRoutingTable()
-	if candidates := rt.Select("nonexistent", "chat", nil, nil); candidates != nil {
+	if candidates := rt.Select("nonexistent", "chat", RequestRequirements{}, nil, nil); candidates != nil {
 		t.Errorf("Select for unknown model should return nil, got %d candidates", len(candidates))
 	}
 }
@@ -147,14 +147,14 @@ func TestSelectFormatFiltering(t *testing.T) {
 		{Name: "chat-only", APIKey: "k1"},
 	}
 
-	rt.Rebuild(results, dbProviders, memProviders, nil)
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
 	// Chat format should work
-	if c := rt.Select("m1", "chat", nil, nil); len(c) != 1 {
+	if c := rt.Select("m1", "chat", RequestRequirements{}, nil, nil); len(c) != 1 {
 		t.Errorf("chat format: got %d, want 1", len(c))
 	}
 	// Chat providers should also serve responses format (most support both; failover handles 404)
-	if c := rt.Select("m1", "responses", nil, nil); len(c) == 0 {
+	if c := rt.Select("m1", "responses", RequestRequirements{}, nil, nil); len(c) == 0 {
 		t.Errorf("responses format: got 0, want >0 (chat providers should be candidates for responses)")
 	}
 }
@@ -162,13 +162,13 @@ func TestSelectFormatFiltering(t *testing.T) {
 func TestSelectTop1Priority(t *testing.T) {
 	rt := NewRoutingTable()
 	results, dbProviders, memProviders := makeTestData()
-	rt.Rebuild(results, dbProviders, memProviders, nil)
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
 	// Run 100 selections and verify the best provider is chosen ~90% of the time
 	bestCount := 0
 	n := 1000
 	for i := 0; i < n; i++ {
-		candidates := rt.Select("gpt-5", "chat", nil, nil)
+		candidates := rt.Select("gpt-5", "chat", RequestRequirements{}, nil, nil)
 		if candidates[0].ProviderName == "fast" {
 			bestCount++
 		}
@@ -200,10 +200,10 @@ func TestRebuildBreakerOpen(t *testing.T) {
 	// Open breaker for provider 1
 	breakers.ForceState(1, "m1", BreakerOpen)
 
-	rt.Rebuild(results, dbProviders, memProviders, nil)
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
 	// Breaker applied at Select time, not Rebuild time
-	candidates := rt.Select("m1", "chat", nil, breakers)
+	candidates := rt.Select("m1", "chat", RequestRequirements{}, nil, breakers)
 	if len(candidates) != 1 {
 		t.Fatalf("got %d candidates, want 1 (open breaker filtered)", len(candidates))
 	}
@@ -227,7 +227,7 @@ func TestSelectErrorRatePenalty(t *testing.T) {
 		{Name: "reliable", APIKey: "k1"},
 		{Name: "flaky", APIKey: "k2"},
 	}
-	rt.Rebuild(results, dbProviders, memProviders, nil)
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
 	// Simulate flaky provider having 40% error rate (4 errors / 10 requests)
 	stats := NewStats()
@@ -239,19 +239,256 @@ func TestSelectErrorRatePenalty(t *testing.T) {
 		stats.Record(1, "m1", 100, false)
 	}
 
-	candidates := rt.Select("m1", "chat", stats, nil)
+	candidates := rt.Select("m1", "chat", RequestRequirements{}, stats, nil)
 	if len(candidates) < 2 {
 		t.Fatal("expected 2 candidates")
 	}
 	// Check that reliable is chosen most of the time (90% of 90% = ~81%)
 	reliableFirst := 0
 	for i := 0; i < 200; i++ {
-		c := rt.Select("m1", "chat", stats, nil)
+		c := rt.Select("m1", "chat", RequestRequirements{}, stats, nil)
 		if c[0].ProviderName == "reliable" {
 			reliableFirst++
 		}
 	}
 	if reliableFirst < 140 { // should be ~162/200, allow margin
 		t.Errorf("reliable chosen %d/200 times, expected >140 (flaky has 40%% error rate)", reliableFirst)
+	}
+}
+
+func TestSelectFiltersResponsesToolCapability(t *testing.T) {
+	rt := NewRoutingTable()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "bad-responses", Model: "gpt-5.4", Vendor: "openai", Status: "ok", Correct: true, LatencyMs: 500},
+		{ProviderID: 2, ProviderName: "good-responses", Model: "gpt-5.4", Vendor: "openai", Status: "ok", Correct: true, LatencyMs: 900},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "bad-responses", BaseURL: "https://bad.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+		{ID: 2, Name: "good-responses", BaseURL: "https://good.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "bad-responses", APIKey: "k1"},
+		{Name: "good-responses", APIKey: "k2"},
+	}
+	trueVal := true
+	falseVal := false
+	caps := map[int64]map[string]store.CapabilityRow{
+		1: {
+			"gpt-5.4": {
+				ProviderID:         1,
+				Model:              "gpt-5.4",
+				ResponsesBasic:     &trueVal,
+				ResponsesToolUse:   &falseVal,
+				ResponsesStreaming: &trueVal,
+			},
+		},
+		2: {
+			"gpt-5.4": {
+				ProviderID:         2,
+				Model:              "gpt-5.4",
+				ResponsesBasic:     &trueVal,
+				ResponsesToolUse:   &trueVal,
+				ResponsesStreaming: &trueVal,
+			},
+		},
+	}
+
+	rt.Rebuild(results, dbProviders, memProviders, nil, caps)
+
+	candidates := rt.Select("gpt-5.4", "responses", RequestRequirements{NeedsTools: true}, nil, nil)
+	if len(candidates) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(candidates))
+	}
+	if candidates[0].ProviderName != "good-responses" {
+		t.Fatalf("selected %s, want good-responses", candidates[0].ProviderName)
+	}
+}
+
+func TestApplyRequestRequirementsAllowsBasicResponsesWithoutTools(t *testing.T) {
+	base := true
+	noTools := false
+	sp := ScoredProvider{
+		APIFormat:        "responses",
+		Score:            1,
+		ResponsesBasic:   &base,
+		ResponsesToolUse: &noTools,
+	}
+
+	_, rank, ok := applyRequestRequirements(sp, "responses", RequestRequirements{})
+	if !ok {
+		t.Fatal("provider should remain eligible for plain responses requests")
+	}
+	if rank != 0 {
+		t.Fatalf("rank = %d, want 0 for a native known-good responses provider", rank)
+	}
+}
+
+func TestApplyRequestRequirementsRejectsKnownBadResponsesSupport(t *testing.T) {
+	basic := false
+	sp := ScoredProvider{
+		APIFormat:      "chat",
+		Score:          1,
+		ResponsesBasic: &basic,
+	}
+
+	if _, _, ok := applyRequestRequirements(sp, "responses", RequestRequirements{}); ok {
+		t.Fatal("known non-responses provider should be filtered for /responses")
+	}
+}
+
+func TestApplyRequestRequirementsRejectsRequiredToolCallWithoutCapability(t *testing.T) {
+	basic := true
+	noTools := false
+	sp := ScoredProvider{
+		APIFormat:        "responses",
+		Score:            1,
+		ResponsesBasic:   &basic,
+		ResponsesToolUse: &noTools,
+	}
+
+	if _, _, ok := applyRequestRequirements(sp, "responses", RequestRequirements{
+		NeedsTools:    true,
+		NeedsToolCall: true,
+	}); ok {
+		t.Fatal("provider lacking tool capability should be filtered when tool call is required")
+	}
+}
+
+func TestApplyRequestRequirementsPenalizesUnknownRequiredToolCall(t *testing.T) {
+	basic := true
+	sp := ScoredProvider{
+		APIFormat:      "responses",
+		Score:          1,
+		ResponsesBasic: &basic,
+	}
+
+	_, rank, ok := applyRequestRequirements(sp, "responses", RequestRequirements{
+		NeedsTools:    true,
+		NeedsToolCall: true,
+	})
+	if !ok {
+		t.Fatal("unknown tool capability should remain as degraded fallback, not hard-filter")
+	}
+	if rank == 0 {
+		t.Fatal("unknown required tool capability should be ranked below known-good providers")
+	}
+}
+
+func TestSelectAllowsResponsesBasicWithoutToolUseWhenNoToolsRequested(t *testing.T) {
+	rt := NewRoutingTable()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "basic-only", Model: "gpt-5.4", Vendor: "openai", Status: "ok", Correct: true, LatencyMs: 500},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "basic-only", BaseURL: "https://basic.example.com/v1", Status: "ok", Health: 100, APIFormat: "responses"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "basic-only", APIKey: "k1"},
+	}
+	trueVal := true
+	falseVal := false
+	caps := map[int64]map[string]store.CapabilityRow{
+		1: {
+			"gpt-5.4": {
+				ProviderID:       1,
+				Model:            "gpt-5.4",
+				ResponsesBasic:   &trueVal,
+				ResponsesToolUse: &falseVal,
+			},
+		},
+	}
+
+	rt.Rebuild(results, dbProviders, memProviders, nil, caps)
+
+	candidates := rt.Select("gpt-5.4", "responses", RequestRequirements{}, nil, nil)
+	if len(candidates) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(candidates))
+	}
+	if candidates[0].ProviderName != "basic-only" {
+		t.Fatalf("selected %s, want basic-only", candidates[0].ProviderName)
+	}
+}
+
+func TestSelectPrefersKnownResponsesSupportOverUnknownFallback(t *testing.T) {
+	rt := NewRoutingTable()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "known", Model: "gpt-5.4", Vendor: "openai", Status: "ok", Correct: true, LatencyMs: 900},
+		{ProviderID: 2, ProviderName: "unknown", Model: "gpt-5.4", Vendor: "openai", Status: "ok", Correct: true, LatencyMs: 100},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "known", BaseURL: "https://known.example.com/v1", Status: "ok", Health: 100, APIFormat: "responses"},
+		{ID: 2, Name: "unknown", BaseURL: "https://unknown.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "known", APIKey: "k1"},
+		{Name: "unknown", APIKey: "k2"},
+	}
+	trueVal := true
+	caps := map[int64]map[string]store.CapabilityRow{
+		1: {
+			"gpt-5.4": {
+				ProviderID:     1,
+				Model:          "gpt-5.4",
+				ResponsesBasic: &trueVal,
+			},
+		},
+	}
+
+	rt.Rebuild(results, dbProviders, memProviders, nil, caps)
+
+	candidates := rt.Select("gpt-5.4", "responses", RequestRequirements{}, nil, nil)
+	if len(candidates) < 2 {
+		t.Fatalf("got %d candidates, want at least 2", len(candidates))
+	}
+	if candidates[0].ProviderName != "known" {
+		t.Fatalf("selected %s, want known", candidates[0].ProviderName)
+	}
+}
+
+func TestDebugSelectionUsesRequestAwareOrdering(t *testing.T) {
+	rt := NewRoutingTable()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "fast-but-unknown", Model: "gpt-5.4", Vendor: "openai", Status: "ok", Correct: true, LatencyMs: 100},
+		{ProviderID: 2, ProviderName: "known-good", Model: "gpt-5.4", Vendor: "openai", Status: "ok", Correct: true, LatencyMs: 800},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "fast-but-unknown", BaseURL: "https://unknown.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+		{ID: 2, Name: "known-good", BaseURL: "https://good.example.com/v1", Status: "ok", Health: 100, APIFormat: "responses"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "fast-but-unknown", APIKey: "k1"},
+		{Name: "known-good", APIKey: "k2"},
+	}
+	trueVal := true
+	caps := map[int64]map[string]store.CapabilityRow{
+		2: {
+			"gpt-5.4": {
+				ProviderID:         2,
+				Model:              "gpt-5.4",
+				ResponsesBasic:     &trueVal,
+				ResponsesToolUse:   &trueVal,
+				ResponsesStreaming: &trueVal,
+			},
+		},
+	}
+
+	rt.Rebuild(results, dbProviders, memProviders, nil, caps)
+
+	debug := rt.DebugSelection("gpt-5.4", "responses", RequestRequirements{
+		NeedsStreaming: true,
+		NeedsTools:     true,
+		NeedsToolCall:  true,
+	}, nil, nil)
+	if len(debug) != 2 {
+		t.Fatalf("got %d candidates, want 2", len(debug))
+	}
+	if debug[0].ProviderName != "known-good" {
+		t.Fatalf("first debug candidate = %s, want known-good", debug[0].ProviderName)
+	}
+	if debug[0].MatchRank != 0 {
+		t.Fatalf("known-good match rank = %d, want 0", debug[0].MatchRank)
+	}
+	if debug[1].MatchRank <= debug[0].MatchRank {
+		t.Fatalf("unknown fallback should rank worse: %+v", debug)
 	}
 }

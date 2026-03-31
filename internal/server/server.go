@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,294 @@ func isValidProviderName(name string) bool {
 // isClaudeModel returns true if the model name is an Anthropic Claude model.
 func isClaudeModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(model), "claude")
+}
+
+func shouldProbeResponsesCapability(model, providerFormat string) bool {
+	if providerFormat == "responses" {
+		return true
+	}
+	low := strings.ToLower(model)
+	return strings.Contains(low, "gpt-5") ||
+		strings.Contains(low, "gpt-4.1") ||
+		strings.Contains(low, "codex") ||
+		strings.HasPrefix(low, "o1") ||
+		strings.HasPrefix(low, "o3") ||
+		strings.HasPrefix(low, "o4")
+}
+
+const capabilityRefreshInterval = 24 * time.Hour
+const capabilityProbeLimit = 3
+
+type capabilityProbeTarget struct {
+	Result        checker.TestResult
+	NeedChat      bool
+	NeedResponses bool
+}
+
+type providerRunSummary struct {
+	Models   int
+	OK       int
+	Correct  int
+	Status   string
+	Health   float64
+	ErrorMsg string
+}
+
+func chatCapabilityNeedsRefresh(row store.CapabilityRow) bool {
+	if row.Streaming == nil || row.ToolUse == nil {
+		return true
+	}
+	return !row.ChatTestedAt.Valid || time.Since(row.ChatTestedAt.Time) >= capabilityRefreshInterval
+}
+
+func responsesCapabilityNeedsRefresh(row store.CapabilityRow) bool {
+	if row.ResponsesBasic == nil || row.ResponsesStreaming == nil || row.ResponsesToolUse == nil {
+		return true
+	}
+	return !row.ResponsesTestedAt.Valid || time.Since(row.ResponsesTestedAt.Time) >= capabilityRefreshInterval
+}
+
+func summarizeProviderResults(results []checker.TestResult, providerErr string) providerRunSummary {
+	summary := providerRunSummary{
+		Models: len(results),
+		Status: "down",
+	}
+	for _, r := range results {
+		if r.Status == "ok" {
+			summary.OK++
+		}
+		if r.Correct {
+			summary.Correct++
+		}
+	}
+	if summary.Models > 0 {
+		ratio := float64(summary.Correct) / float64(summary.Models)
+		switch {
+		case ratio > 0.8:
+			summary.Status = "ok"
+		case ratio > 0.5:
+			summary.Status = "degraded"
+		}
+		summary.Health = ratio * 100
+	}
+	if providerErr != "" && summary.Models == 0 {
+		summary.Status = "error"
+		summary.ErrorMsg = providerErr
+	}
+	return summary
+}
+
+func capabilityModelPriority(model string) int {
+	low := strings.ToLower(model)
+	switch {
+	case low == "gpt-5.4" || strings.HasPrefix(low, "gpt-5.4-"):
+		return 0
+	case strings.HasPrefix(low, "gpt-5") && !strings.Contains(low, "codex"):
+		return 1
+	case strings.HasPrefix(low, "gpt-4.1"):
+		return 2
+	case strings.HasPrefix(low, "o4"):
+		return 3
+	case strings.HasPrefix(low, "o3"):
+		return 4
+	case strings.HasPrefix(low, "o1"):
+		return 5
+	case strings.Contains(low, "codex"):
+		return 6
+	case strings.HasPrefix(low, "gpt"):
+		return 7
+	default:
+		return 8
+	}
+}
+
+func selectCapabilityProbeTargets(prov provider.Provider, results []checker.TestResult, existing []store.CapabilityRow, limit int) []capabilityProbeTarget {
+	capByModel := make(map[string]store.CapabilityRow, len(existing))
+	for _, c := range existing {
+		capByModel[c.Model] = c
+	}
+
+	targets := make([]capabilityProbeTarget, 0, len(results))
+	seen := make(map[string]bool, len(results))
+	for _, r := range results {
+		if !r.Correct || seen[r.Model] {
+			continue
+		}
+		seen[r.Model] = true
+
+		capRow, hasCap := capByModel[r.Model]
+		needChat := prov.APIFormat != "responses" && (!hasCap || chatCapabilityNeedsRefresh(capRow))
+		needResponses := shouldProbeResponsesCapability(r.Model, prov.APIFormat) &&
+			(!hasCap || responsesCapabilityNeedsRefresh(capRow))
+		if !needChat && !needResponses {
+			continue
+		}
+
+		targets = append(targets, capabilityProbeTarget{
+			Result:        r,
+			NeedChat:      needChat,
+			NeedResponses: needResponses,
+		})
+	}
+
+	sort.SliceStable(targets, func(i, j int) bool {
+		a := targets[i]
+		b := targets[j]
+		if a.NeedResponses != b.NeedResponses {
+			return a.NeedResponses
+		}
+		if pa, pb := capabilityModelPriority(a.Result.Model), capabilityModelPriority(b.Result.Model); pa != pb {
+			return pa < pb
+		}
+		if a.NeedChat != b.NeedChat {
+			return a.NeedChat
+		}
+		if a.Result.LatencyMs != b.Result.LatencyMs {
+			return a.Result.LatencyMs < b.Result.LatencyMs
+		}
+		return a.Result.Model < b.Result.Model
+	})
+
+	if limit > 0 && len(targets) > limit {
+		targets = targets[:limit]
+	}
+	return targets
+}
+
+func (s *Server) refreshProviderMetadataAndCapabilities(ctx context.Context, prov provider.Provider, providerID int64, results []checker.TestResult) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	dbProv, err := s.store.GetProviderByName(prov.Name)
+	if err == nil && dbProv.Platform == "unknown" {
+		if platform := checker.DetectPlatform(ctx, s.engine.Client, prov.BaseURL); platform != "unknown" {
+			if err := s.store.UpdateProviderPlatform(providerID, platform); err != nil {
+				log.Printf("[platform] %s: update error: %v", prov.Name, err)
+			}
+		}
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	if prov.AccessToken != "" {
+		bi, berr := checker.QueryBalance(ctx, s.engine.Client, prov.BaseURL, prov.AccessToken)
+		if berr != nil {
+			log.Printf("[balance] %s: error: %v", prov.Name, berr)
+		} else if bi != nil {
+			log.Printf("[balance] %s: quota=%.0f", prov.Name, bi.Remaining)
+			if err := s.store.UpdateProviderBalance(providerID, bi.Remaining); err != nil {
+				log.Printf("[balance] %s: update error: %v", prov.Name, err)
+			}
+		} else {
+			log.Printf("[balance] %s: no data (token may be invalid)", prov.Name)
+		}
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	existingCaps, err := s.store.GetCapabilities(providerID)
+	if err != nil {
+		log.Printf("[capability] %s: load error: %v", prov.Name, err)
+		return
+	}
+	targets := selectCapabilityProbeTargets(prov, results, existingCaps, capabilityProbeLimit)
+	if len(targets) == 0 {
+		return
+	}
+
+	var summaries []string
+	for _, target := range targets {
+		var formats []string
+		if target.NeedResponses {
+			formats = append(formats, "responses")
+		}
+		if target.NeedChat {
+			formats = append(formats, "chat")
+		}
+		summaries = append(summaries, fmt.Sprintf("%s[%s]", target.Result.Model, strings.Join(formats, "+")))
+	}
+	log.Printf("[capability] %s: probing %s", prov.Name, strings.Join(summaries, ", "))
+
+	for _, target := range targets {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if target.NeedResponses {
+			caps := checker.ProbeResponsesCapabilities(ctx, s.engine.Client, prov.BaseURL, prov.APIKey, target.Result.Model)
+			if caps.Basic != nil || caps.Streaming != nil || caps.ToolUse != nil {
+				if err := s.store.UpsertCapability(providerID, target.Result.Model, "responses", caps.Basic, caps.Streaming, caps.ToolUse); err != nil {
+					log.Printf("[capability] %s/%s responses update error: %v", prov.Name, target.Result.Model, err)
+				}
+			}
+		}
+		if target.NeedChat {
+			caps := checker.ProbeCapabilities(ctx, s.engine.Client, prov.BaseURL, prov.APIKey, target.Result.Model, "chat")
+			if caps.Streaming != nil || caps.ToolUse != nil {
+				if err := s.store.UpsertCapability(providerID, target.Result.Model, "chat", nil, caps.Streaming, caps.ToolUse); err != nil {
+					log.Printf("[capability] %s/%s chat update error: %v", prov.Name, target.Result.Model, err)
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) rebuildProxyTable(memProviders []provider.Provider) {
+	if s.proxy == nil {
+		return
+	}
+
+	s.proxyRebuildMu.Lock()
+	defer s.proxyRebuildMu.Unlock()
+
+	results, _ := s.store.GetLatestResults()
+	dbProviders, _ := s.store.GetProviders()
+	caps, _ := s.store.GetAllCapabilities()
+	s.proxy.RebuildTable(results, dbProviders, memProviders, s.buildFingerprintMap(), caps)
+}
+
+func checkRunModeLabel(mode checker.CheckMode) string {
+	if mode == checker.ModeFull {
+		return "full"
+	}
+	return "basic"
+}
+
+func authoritativeProviderState(mode checker.CheckMode, pr *checker.ProviderResult) (replaceCurrent bool, updateProvider bool) {
+	if mode != checker.ModeFull || pr == nil {
+		return false, false
+	}
+	if pr.Error != "" {
+		// A full run that fails before any model results are written is still authoritative
+		// about the provider being unavailable right now, so we clear the current snapshot.
+		return len(pr.Results) == 0, len(pr.Results) == 0
+	}
+	if len(pr.Results) != pr.ModelsFound {
+		return false, false
+	}
+	return true, true
+}
+
+func toStoreCheckResults(results []checker.TestResult) []store.CheckResultInput {
+	out := make([]store.CheckResultInput, 0, len(results))
+	for _, r := range results {
+		out = append(out, store.CheckResultInput{
+			Model:        r.Model,
+			Vendor:       r.Vendor,
+			Status:       r.Status,
+			Correct:      r.Correct,
+			Answer:       r.Answer,
+			LatencyMs:    r.LatencyMs,
+			ErrorMsg:     r.Error,
+			HasReasoning: r.HasReasoning,
+		})
+	}
+	return out
 }
 
 func csrfHandler(h http.Handler) http.Handler {
@@ -81,9 +370,10 @@ type Server struct {
 	notifier  *notifier.Notifier
 	proxy     *proxy.Proxy
 
-	mu         sync.Mutex
-	isChecking bool
-	lastCheck  time.Time
+	mu             sync.Mutex
+	proxyRebuildMu sync.Mutex
+	isChecking     bool
+	lastCheck      time.Time
 }
 
 // ProviderCard is the view model for a dashboard card.
@@ -146,7 +436,8 @@ type ModelProviderRow struct {
 	Correct      bool
 	Verdict      string
 	VerdictClass string
-	FPScore      int // fingerprint total score (0 = no data)
+	FPScore      int    // fingerprint total score (0 = no data)
+	FPState      string // "exact", "sampled", "none"
 	ToolUse      string // "true", "false", ""
 	Streaming    string
 	IsBest       bool
@@ -163,15 +454,15 @@ type pageData struct {
 	Events    []EventItem
 	// Provider detail
 	Provider *struct {
-		Name     string
-		Status   string
-		Health   int
-		URL      string
-		Pinned   bool
-		Note     string
-		APIKey   string
+		Name        string
+		Status      string
+		Health      int
+		URL         string
+		Pinned      bool
+		Note        string
+		APIKey      string
 		AccessToken string
-		Priority float64
+		Priority    float64
 	}
 	Models []ModelRow
 	// Models view
@@ -183,16 +474,16 @@ type pageData struct {
 
 // FingerprintViewRow is the view model for the fingerprint results table.
 type FingerprintViewRow struct {
-	ProviderName  string
-	Model         string
+	ProviderName   string
+	Model          string
 	L1, L2, L3, L4 string // "1/1", "2/3" format
-	TotalScore    int
-	ExpectedTier  string
-	ExpectedMin   int
-	Verdict       string
-	VerdictClass  string
-	SelfIDVerdict string
-	SelfIDDetail  string
+	TotalScore     int
+	ExpectedTier   string
+	ExpectedMin    int
+	Verdict        string
+	VerdictClass   string
+	SelfIDVerdict  string
+	SelfIDDetail   string
 }
 
 func New(cfg *config.AppConfig, st *store.Store, eng *checker.Engine, providers []provider.Provider) (*Server, error) {
@@ -332,7 +623,24 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 	}()
 
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
-	s.store.InsertCheckRun(runID, "basic", triggerType)
+	if err := s.store.InsertCheckRun(runID, checkRunModeLabel(mode), triggerType); err != nil {
+		log.Printf("insert check run %s: %v", runID, err)
+		return
+	}
+	runFinished := false
+	defer func() {
+		if runFinished {
+			return
+		}
+		summary := "check aborted"
+		if ctx.Err() != nil {
+			summary = ctx.Err().Error()
+		}
+		if err := s.store.AbortCheckRun(runID, summary); err != nil {
+			log.Printf("abort check run %s: %v", runID, err)
+		}
+		s.sseHub.Publish(SSEEvent{Type: "check_completed", Data: summary})
+	}()
 
 	// Sync providers to DB
 	provIDs := make(map[string]int64)
@@ -366,7 +674,7 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 	}
 
 	var (
-		totalMu                                sync.Mutex
+		totalMu                                            sync.Mutex
 		totalProviders, totalModels, totalOK, totalCorrect int
 	)
 
@@ -385,55 +693,37 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 			return
 		}
 
-		// Write results to DB immediately
-		provModels, provOK, provCorrect := 0, 0, 0
-		for _, r := range pr.Results {
-			s.store.InsertCheckResult(runID, pid, r.Model, r.Vendor, r.Status,
-				r.Correct, r.Answer, r.LatencyMs, r.Error, r.HasReasoning)
-			provModels++
-			if r.Status == "ok" {
-				provOK++
-			}
-			if r.Correct {
-				provCorrect++
-			}
+		storeResults := toStoreCheckResults(pr.Results)
+		runSummary := summarizeProviderResults(pr.Results, pr.Error)
+		replaceCurrent, updateProviderState := authoritativeProviderState(mode, pr)
+		if err := s.store.ApplyProviderCheck(runID, pid, storeResults, replaceCurrent, updateProviderState, runSummary.Status, runSummary.Health, runSummary.ErrorMsg); err != nil {
+			log.Printf("[store] %s: apply provider check failed: %v", pr.Provider, err)
+			return
 		}
 
 		totalMu.Lock()
 		totalProviders++
-		totalModels += provModels
-		totalOK += provOK
-		totalCorrect += provCorrect
+		totalModels += runSummary.Models
+		totalOK += runSummary.OK
+		totalCorrect += runSummary.Correct
 		totalMu.Unlock()
 
 		// Change detection
-		if prev := prevByProvider[pid]; prev != nil {
-			for _, de := range checker.Diff(pr.Provider, pr.Results, prev) {
-				s.store.InsertEvent(de.Type, de.Provider, de.Model, de.OldValue, de.NewValue, de.Message)
-				s.sseHub.Publish(SSEEvent{Type: "event_created", Data: de.Message})
-				if s.notifier != nil {
-					s.notifier.HandleEvent(de.Type, de.Provider, de.Model, de.OldValue, de.NewValue, de.Message)
+		if replaceCurrent {
+			if prev := prevByProvider[pid]; prev != nil {
+				for _, de := range checker.Diff(pr.Provider, pr.Results, prev) {
+					s.store.InsertEvent(de.Type, de.Provider, de.Model, de.OldValue, de.NewValue, de.Message)
+					s.sseHub.Publish(SSEEvent{Type: "event_created", Data: de.Message})
+					if s.notifier != nil {
+						s.notifier.HandleEvent(de.Type, de.Provider, de.Model, de.OldValue, de.NewValue, de.Message)
+					}
 				}
 			}
 		}
 
-		// Update provider status
-		status, health := "down", 0.0
-		if len(pr.Results) > 0 {
-			ratio := float64(provCorrect) / float64(len(pr.Results))
-			if ratio > 0.8 {
-				status = "ok"
-			} else if ratio > 0.5 {
-				status = "degraded"
-			}
-			health = ratio * 100
+		if replaceCurrent || updateProviderState {
+			s.rebuildProxyTable(s.providers)
 		}
-		errMsg := ""
-		if pr.Error != "" && len(pr.Results) == 0 {
-			status = "error"
-			errMsg = pr.Error
-		}
-		s.store.UpdateProviderStatus(pid, status, health, errMsg)
 
 		// Push per-provider SSE update so dashboard refreshes incrementally
 		s.sseHub.Publish(SSEEvent{Type: "provider_done", Data: pr.Provider})
@@ -443,52 +733,23 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 		if prov == nil {
 			return
 		}
-		dbProv, _ := s.store.GetProviderByName(pr.Provider)
-		if dbProv != nil && dbProv.Platform == "unknown" {
-			if platform := checker.DetectPlatform(ctx, s.engine.Client, prov.BaseURL); platform != "unknown" {
-				s.store.UpdateProviderPlatform(pid, platform)
-			}
-		}
-		if prov.AccessToken != "" {
-			bi, berr := checker.QueryBalance(ctx, s.engine.Client, prov.BaseURL, prov.AccessToken)
-			if berr != nil {
-				log.Printf("[balance] %s: error: %v", pr.Provider, berr)
-			} else if bi != nil {
-				log.Printf("[balance] %s: quota=%.0f", pr.Provider, bi.Remaining)
-				s.store.UpdateProviderBalance(pid, bi.Remaining)
-			} else {
-				log.Printf("[balance] %s: no data (token may be invalid)", pr.Provider)
-			}
-		}
-		// Capability probing: max 3 new models per provider
-		existingCaps, _ := s.store.GetCapabilities(pid)
-		capSet := make(map[string]bool)
-		for _, c := range existingCaps {
-			capSet[c.Model] = true
-		}
-		probed := 0
-		for _, r := range pr.Results {
-			if probed >= 3 || !r.Correct || capSet[r.Model] || ctx.Err() != nil {
-				continue
-			}
-			tu, st := checker.ProbeCapabilities(ctx, s.engine.Client, prov.BaseURL, prov.APIKey, r.Model, prov.APIFormat)
-			s.store.UpsertCapability(pid, r.Model, &st, &tu)
-			probed++
-		}
+		s.refreshProviderMetadataAndCapabilities(ctx, *prov, pid, pr.Results)
 	})
 
 	totalMu.Lock()
 	summary := fmt.Sprintf("%d providers, %d models, %d ok, %d correct",
 		totalProviders, totalModels, totalOK, totalCorrect)
 	totalMu.Unlock()
-	s.store.FinishCheckRun(runID, totalProviders, totalModels, totalOK, totalCorrect, summary)
+	if err := s.store.FinishCheckRun(runID, totalProviders, totalModels, totalOK, totalCorrect, summary); err != nil {
+		log.Printf("finish check run %s: %v", runID, err)
+		return
+	}
+	runFinished = true
 	s.sseHub.Publish(SSEEvent{Type: "check_completed", Data: summary})
 
 	// Rebuild proxy routing table with fresh check data
 	if s.proxy != nil {
-		results, _ := s.store.GetLatestResults()
-		dbProviders, _ := s.store.GetProviders()
-		s.proxy.RebuildTable(results, dbProviders, s.providers, s.buildFingerprintMap())
+		s.rebuildProxyTable(s.providers)
 		log.Printf("[proxy] routing table rebuilt: %d models", len(s.proxy.Table().Models()))
 	}
 }
@@ -598,8 +859,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	// Build fingerprint lookup: (providerName, model) → FingerprintRow
 	fpRows, _ := s.store.GetLatestFingerprints()
 	fpByKey := make(map[[2]string]store.FingerprintRow, len(fpRows))
+	fpCountByProvider := make(map[string]int, len(fpRows))
 	for _, f := range fpRows {
 		fpByKey[[2]string{f.ProviderName, f.Model}] = f
+		fpCountByProvider[f.ProviderName]++
 	}
 
 	// Build provider lookup: id -> (name, baseURL)
@@ -710,6 +973,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			if fp, ok := fpByKey[[2]string{pr.providerName, k.model}]; ok {
 				row.Verdict = fp.Verdict
 				row.FPScore = fp.TotalScore
+				row.FPState = "exact"
 				switch {
 				case fp.Verdict == "GENUINE":
 					row.VerdictClass = "genuine"
@@ -720,6 +984,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 				default:
 					row.VerdictClass = "fake"
 				}
+			} else if fpCountByProvider[pr.providerName] > 0 {
+				row.FPState = "sampled"
+			} else {
+				row.FPState = "none"
 			}
 			mg.Providers = append(mg.Providers, row)
 		}
@@ -761,15 +1029,15 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 	data := s.basePageData(dp.Name)
 	provMeta := s.findProvider(dp.Name)
 	data.Provider = &struct {
-		Name     string
-		Status   string
-		Health   int
-		URL      string
-		Pinned   bool
-		Note     string
-		APIKey   string
+		Name        string
+		Status      string
+		Health      int
+		URL         string
+		Pinned      bool
+		Note        string
+		APIKey      string
 		AccessToken string
-		Priority float64
+		Priority    float64
 	}{
 		Name:   dp.Name,
 		Status: dp.Status,
@@ -882,9 +1150,9 @@ func (s *Server) handleTriggerSingleCheck(w http.ResponseWriter, r *http.Request
 	name := r.PathValue("name")
 
 	var target *provider.Provider
-	for _, p := range s.providers {
-		if strings.EqualFold(p.Name, name) {
-			target = &p
+	for i := range s.providers {
+		if strings.EqualFold(s.providers[i].Name, name) {
+			target = &s.providers[i]
 			break
 		}
 	}
@@ -894,52 +1162,67 @@ func (s *Server) handleTriggerSingleCheck(w http.ResponseWriter, r *http.Request
 	}
 
 	// Run synchronously — single provider is fast enough
-	pid, _ := s.store.UpsertProvider(target.Name, target.BaseURL, target.APIFormat, target.Platform)
+	pid, err := s.store.UpsertProvider(target.Name, target.BaseURL, target.APIFormat, target.Platform)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"upsert provider: %s"}`, err), http.StatusInternalServerError)
+		return
+	}
 	pr := s.engine.TestProvider(r.Context(), *target, checker.ModeFull, func(msg string) {
 		log.Printf("[manual] [%s] %s", time.Now().Format("15:04:05"), msg)
 	})
 
 	// Store results
 	runID := fmt.Sprintf("manual-%d", time.Now().UnixNano())
-	s.store.InsertCheckRun(runID, "basic", "manual")
-	for _, tr := range pr.Results {
-		s.store.InsertCheckResult(runID, pid, tr.Model, tr.Vendor, tr.Status,
-			tr.Correct, tr.Answer, tr.LatencyMs, tr.Error, tr.HasReasoning)
+	if err := s.store.InsertCheckRun(runID, "full", "manual"); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"insert check run: %s"}`, err), http.StatusInternalServerError)
+		return
 	}
 
-	correct := 0
-	for _, tr := range pr.Results {
-		if tr.Correct {
-			correct++
+	runFinished := false
+	defer func() {
+		if runFinished {
+			return
 		}
-	}
-	status, health := "down", 0.0
-	if len(pr.Results) > 0 {
-		ratio := float64(correct) / float64(len(pr.Results))
-		if ratio > 0.8 {
-			status = "ok"
-		} else if ratio > 0.5 {
-			status = "degraded"
+		if err := s.store.AbortCheckRun(runID, "manual check aborted"); err != nil {
+			log.Printf("abort manual check %s: %v", runID, err)
 		}
-		health = ratio * 100
+	}()
+
+	runSummary := summarizeProviderResults(pr.Results, pr.Error)
+	replaceCurrent, updateProviderState := authoritativeProviderState(checker.ModeFull, pr)
+	if err := s.store.ApplyProviderCheck(
+		runID,
+		pid,
+		toStoreCheckResults(pr.Results),
+		replaceCurrent,
+		updateProviderState,
+		runSummary.Status,
+		runSummary.Health,
+		runSummary.ErrorMsg,
+	); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"apply provider check: %s"}`, err), http.StatusInternalServerError)
+		return
 	}
-	errMsg := ""
-	if pr.Error != "" && len(pr.Results) == 0 {
-		status = "error"
-		errMsg = pr.Error
+	if err := s.store.FinishCheckRun(runID, 1, runSummary.Models, runSummary.OK, runSummary.Correct,
+		fmt.Sprintf("%s: %d models, %d correct", target.Name, runSummary.Models, runSummary.Correct)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"finish check run: %s"}`, err), http.StatusInternalServerError)
+		return
 	}
-	s.store.UpdateProviderStatus(pid, status, health, errMsg)
-	s.store.FinishCheckRun(runID, 1, len(pr.Results), 0, correct,
-		fmt.Sprintf("%s: %d models, %d correct", target.Name, len(pr.Results), correct))
+	runFinished = true
+	s.refreshProviderMetadataAndCapabilities(r.Context(), *target, pid, pr.Results)
+	if s.proxy != nil {
+		s.rebuildProxyTable(s.providers)
+		log.Printf("[proxy] routing table rebuilt after manual check: %d models", len(s.proxy.Table().Models()))
+	}
 
 	// Return result directly as HTML feedback
-	if errMsg != "" {
-		fmt.Fprintf(w, `<span style="color:var(--down)">%s: %s</span>`, html.EscapeString(name), html.EscapeString(errMsg))
+	if runSummary.ErrorMsg != "" {
+		fmt.Fprintf(w, `<span style="color:var(--down)">%s: %s</span>`, html.EscapeString(name), html.EscapeString(runSummary.ErrorMsg))
 	} else if len(pr.Results) == 0 {
 		fmt.Fprintf(w, `<span style="color:var(--down)">%s: 无可用模型</span>`, html.EscapeString(name))
 	} else {
 		fmt.Fprintf(w, `<span style="color:var(--ok)">%s: %d/%d 正确 — <a href="/provider/%s" style="color:var(--accent)">查看详情</a></span>`,
-			html.EscapeString(name), correct, len(pr.Results), url.PathEscape(name))
+			html.EscapeString(name), runSummary.Correct, len(pr.Results), url.PathEscape(name))
 	}
 }
 
@@ -1091,9 +1374,7 @@ func (s *Server) RunFingerprintAndStore(ctx context.Context, provs []provider.Pr
 
 	// Rebuild proxy routing table with updated fingerprint scores
 	if s.proxy != nil {
-		results, _ := s.store.GetLatestResults()
-		dbProviders, _ := s.store.GetProviders()
-		s.proxy.RebuildTable(results, dbProviders, s.providers, s.buildFingerprintMap())
+		s.rebuildProxyTable(s.providers)
 		log.Printf("[proxy] routing table rebuilt with fingerprint data: %d models", len(s.proxy.Table().Models()))
 	}
 }
@@ -1134,9 +1415,9 @@ func modelSortRank(m ModelRow) int {
 }
 
 func (s *Server) findProvider(name string) *provider.Provider {
-	for _, p := range s.providers {
-		if p.Name == name {
-			return &p
+	for i := range s.providers {
+		if s.providers[i].Name == name {
+			return &s.providers[i]
 		}
 	}
 	return nil
@@ -1255,11 +1536,7 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	config.SaveProviders(s.cfg.ProvidersFile, remaining)
 
 	// Rebuild proxy routing table to remove deleted provider
-	if s.proxy != nil {
-		results, _ := s.store.GetLatestResults()
-		dbProviders, _ := s.store.GetProviders()
-		s.proxy.RebuildTable(results, dbProviders, remaining, s.buildFingerprintMap())
-	}
+	s.rebuildProxyTable(remaining)
 
 	// Redirect to dashboard
 	w.Header().Set("HX-Redirect", "/")
@@ -1363,11 +1640,7 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 	config.SaveProviders(s.cfg.ProvidersFile, provs)
 
 	// Rebuild proxy routing table immediately so priority changes take effect
-	if s.proxy != nil {
-		results, _ := s.store.GetLatestResults()
-		dbProviders, _ := s.store.GetProviders()
-		s.proxy.RebuildTable(results, dbProviders, provs, s.buildFingerprintMap())
-	}
+	s.rebuildProxyTable(provs)
 
 	w.Header().Set("HX-Redirect", "/provider/"+url.PathEscape(effectiveName))
 	w.WriteHeader(http.StatusOK)
@@ -1378,17 +1651,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	type ProxyPageData struct {
 		pageData
-		ProxyEnabled   bool
-		ProxyEndpoint  string
-		ProxyAPIKey    string
-		ProxyWarming   bool
-		ProxyModels    []proxyModelStat
-		ProxyProviders []proxyProviderStat
-		ModelCatalog   []proxy.ModelInfo
-		TotalRequests  int64
-		TotalErrors    int64
-		AvgLatencyMs   int64
-		ModelCount     int
+		ProxyEnabled  bool
+		ProxyEndpoint string
+		ProxyAPIKey   string
+		ProxyWarming  bool
+		ProxyModels   []proxyModelStat
+		ProxyCoverage []proxyProviderStat
+		ProxyTraffic  []proxyProviderStat
+		ModelCatalog  []proxy.ModelInfo
+		TotalRequests int64
+		TotalErrors   int64
+		AvgLatencyMs  int64
+		ModelCount    int
 	}
 
 	pd := ProxyPageData{pageData: data}
@@ -1418,6 +1692,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		modelProviderCount := s.proxy.Table().ModelProviderCount()
+		provModelCount := s.proxy.Table().ProviderModelCount()
+
+		// Provider 路由表应该展示所有已入 routing table 的 provider，
+		// 而不只是最近 10 分钟真正接到流量的那几个。
+		for providerID, routedModels := range provModelCount {
+			pname := nameByID[providerID]
+			if pname == "" {
+				pname = fmt.Sprintf("id:%d", providerID)
+			}
+			providerStats[providerID] = &proxyProviderStat{
+				ProviderName:  pname,
+				ProviderID:    providerID,
+				RoutingModels: routedModels,
+			}
+		}
 
 		for _, ss := range snap {
 			totalReqs += ss.Requests
@@ -1461,16 +1750,30 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return pd.ProxyModels[i].Requests > pd.ProxyModels[j].Requests
 		})
 
-		provModelCount := s.proxy.Table().ProviderModelCount()
 		for _, ps := range providerStats {
-			ps.RoutingModels = provModelCount[ps.ProviderID]
 			if ps.Requests > 0 {
 				ps.ErrorRate = float64(ps.Errors) / float64(ps.Requests) * 100
+				pd.ProxyTraffic = append(pd.ProxyTraffic, *ps)
 			}
-			pd.ProxyProviders = append(pd.ProxyProviders, *ps)
+			pd.ProxyCoverage = append(pd.ProxyCoverage, *ps)
 		}
-		sort.Slice(pd.ProxyProviders, func(i, j int) bool {
-			return pd.ProxyProviders[i].Requests > pd.ProxyProviders[j].Requests
+		sort.Slice(pd.ProxyCoverage, func(i, j int) bool {
+			if pd.ProxyCoverage[i].RoutingModels != pd.ProxyCoverage[j].RoutingModels {
+				return pd.ProxyCoverage[i].RoutingModels > pd.ProxyCoverage[j].RoutingModels
+			}
+			if pd.ProxyCoverage[i].ProviderName != pd.ProxyCoverage[j].ProviderName {
+				return pd.ProxyCoverage[i].ProviderName < pd.ProxyCoverage[j].ProviderName
+			}
+			return pd.ProxyCoverage[i].Requests > pd.ProxyCoverage[j].Requests
+		})
+		sort.Slice(pd.ProxyTraffic, func(i, j int) bool {
+			if pd.ProxyTraffic[i].Requests != pd.ProxyTraffic[j].Requests {
+				return pd.ProxyTraffic[i].Requests > pd.ProxyTraffic[j].Requests
+			}
+			if pd.ProxyTraffic[i].RoutingModels != pd.ProxyTraffic[j].RoutingModels {
+				return pd.ProxyTraffic[i].RoutingModels > pd.ProxyTraffic[j].RoutingModels
+			}
+			return pd.ProxyTraffic[i].ProviderName < pd.ProxyTraffic[j].ProviderName
 		})
 
 		// Model catalog (always available, independent of request stats)
@@ -1498,6 +1801,13 @@ type proxyProviderStat struct {
 	RoutingModels int
 }
 
+func parseOptionalBool(raw string) (bool, error) {
+	if raw == "" {
+		return false, nil
+	}
+	return strconv.ParseBool(raw)
+}
+
 func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 	if s.proxy == nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1509,26 +1819,110 @@ func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 	if debugModel := r.URL.Query().Get("debug"); debugModel != "" {
 		scores := s.proxy.Table().DebugScores(debugModel)
 		type entry struct {
-			Provider  string  `json:"provider"`
-			Score     float64 `json:"score"`
-			LatencyMs int64   `json:"latency_ms"`
-			Format    string  `json:"format"`
+			Provider           string  `json:"provider"`
+			Score              float64 `json:"score"`
+			LatencyMs          int64   `json:"latency_ms"`
+			Format             string  `json:"format"`
+			MatchRank          int     `json:"match_rank,omitempty"`
+			BreakerState       string  `json:"breaker_state,omitempty"`
+			Requests           int64   `json:"requests,omitempty"`
+			Errors             int64   `json:"errors,omitempty"`
+			ErrorRate          float64 `json:"error_rate,omitempty"`
+			ChatStreaming      *bool   `json:"chat_streaming,omitempty"`
+			ChatToolUse        *bool   `json:"chat_tool_use,omitempty"`
+			ResponsesBasic     *bool   `json:"responses_basic,omitempty"`
+			ResponsesStreaming *bool   `json:"responses_streaming,omitempty"`
+			ResponsesToolUse   *bool   `json:"responses_tool_use,omitempty"`
 		}
-		out := make([]entry, len(scores))
+		staticOut := make([]entry, len(scores))
 		for i, sp := range scores {
-			out[i] = entry{sp.ProviderName, sp.Score, sp.LatencyMs, sp.APIFormat}
+			staticOut[i] = entry{
+				Provider:           sp.ProviderName,
+				Score:              sp.Score,
+				LatencyMs:          sp.LatencyMs,
+				Format:             sp.APIFormat,
+				ChatStreaming:      sp.ChatStreaming,
+				ChatToolUse:        sp.ChatToolUse,
+				ResponsesBasic:     sp.ResponsesBasic,
+				ResponsesStreaming: sp.ResponsesStreaming,
+				ResponsesToolUse:   sp.ResponsesToolUse,
+			}
+		}
+
+		requestFormat := strings.TrimSpace(r.URL.Query().Get("format"))
+		if requestFormat == "" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"model":         debugModel,
+				"mode":          "static_only",
+				"note":          "static_scores ignore request shape; pass format=chat|responses and optional stream/tools/tool_call to inspect actual routing",
+				"static_scores": staticOut,
+			})
+			return
+		}
+		if requestFormat != "chat" && requestFormat != "responses" {
+			http.Error(w, `{"error":"invalid format"}`, http.StatusBadRequest)
+			return
+		}
+		streaming, err := parseOptionalBool(r.URL.Query().Get("stream"))
+		if err != nil {
+			http.Error(w, `{"error":"invalid stream flag"}`, http.StatusBadRequest)
+			return
+		}
+		tools, err := parseOptionalBool(r.URL.Query().Get("tools"))
+		if err != nil {
+			http.Error(w, `{"error":"invalid tools flag"}`, http.StatusBadRequest)
+			return
+		}
+		toolCall, err := parseOptionalBool(r.URL.Query().Get("tool_call"))
+		if err != nil {
+			http.Error(w, `{"error":"invalid tool_call flag"}`, http.StatusBadRequest)
+			return
+		}
+
+		req := proxy.RequestRequirements{
+			NeedsStreaming: streaming,
+			NeedsTools:     tools,
+			NeedsToolCall:  tools && toolCall,
+		}
+		requestCandidates := s.proxy.Table().DebugSelection(debugModel, requestFormat, req, s.proxy.Stats(), s.proxy.Breakers())
+		requestOut := make([]entry, len(requestCandidates))
+		for i, candidate := range requestCandidates {
+			requestOut[i] = entry{
+				Provider:           candidate.ProviderName,
+				Score:              candidate.Score,
+				LatencyMs:          candidate.LatencyMs,
+				Format:             candidate.APIFormat,
+				MatchRank:          candidate.MatchRank,
+				BreakerState:       candidate.BreakerState.String(),
+				Requests:           candidate.Requests,
+				Errors:             candidate.Errors,
+				ErrorRate:          candidate.ErrorRate,
+				ChatStreaming:      candidate.ChatStreaming,
+				ChatToolUse:        candidate.ChatToolUse,
+				ResponsesBasic:     candidate.ResponsesBasic,
+				ResponsesStreaming: candidate.ResponsesStreaming,
+				ResponsesToolUse:   candidate.ResponsesToolUse,
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(out)
+		json.NewEncoder(w).Encode(map[string]any{
+			"model":              debugModel,
+			"mode":               "request_aware",
+			"request_format":     requestFormat,
+			"requirements":       req,
+			"request_candidates": requestOut,
+			"static_scores":      staticOut,
+		})
 		return
 	}
 
 	snap := s.proxy.Stats().Snapshot()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"enabled":  s.proxy.Config().Enabled,
-		"ready":    s.proxy.Table().Ready(),
-		"models":   s.proxy.Table().Models(),
-		"stats":    snap,
+		"enabled": s.proxy.Config().Enabled,
+		"ready":   s.proxy.Table().Ready(),
+		"models":  s.proxy.Table().Models(),
+		"stats":   snap,
 	})
 }

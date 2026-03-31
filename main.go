@@ -226,13 +226,14 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 					}
 				}
 			}
-			p.RebuildTable(results, dbProviders, providers, fpMap)
+			caps, _ := st.GetAllCapabilities()
+			p.RebuildTable(results, dbProviders, providers, fpMap, caps)
 			log.Printf("[proxy] routing table loaded: %d models", len(p.Table().Models()))
 		} else {
-			// No check data yet — trigger a warmup quick check
+			// No authoritative snapshot yet — run a full warmup so current_results starts from a real snapshot.
 			log.Printf("[proxy] no check data, running warmup check...")
 			go func() {
-				srv.RunCheckAndStore(ctx, providers, "warmup", checker.ModeQuick)
+				srv.RunCheckAndStore(ctx, providers, "warmup", checker.ModeFull)
 			}()
 		}
 		log.Printf("Proxy: http://%s/v1", cfg.Listen)
@@ -489,15 +490,18 @@ func runAddProvider(path string, providers []provider.Provider, cfg *config.AppC
 	fmt.Println("\n=== Add Provider ===")
 	name := prompt("Name: ")
 	if name == "" {
-		fmt.Println("Cancelled"); return
+		fmt.Println("Cancelled")
+		return
 	}
 	baseURL := prompt("Base URL (e.g. https://example.com/v1): ")
 	if baseURL == "" {
-		fmt.Println("Cancelled"); return
+		fmt.Println("Cancelled")
+		return
 	}
 	apiKey := prompt("API Key (sk-xxx): ")
 	if apiKey == "" {
-		fmt.Println("Cancelled"); return
+		fmt.Println("Cancelled")
+		return
 	}
 	fmtStr := prompt("API format (enter=chat, r=responses): ")
 
@@ -513,7 +517,8 @@ func runAddProvider(path string, providers []provider.Provider, cfg *config.AppC
 		fmt.Printf("  %s\n", err)
 		confirm := prompt("Add anyway? (y/N): ")
 		if strings.ToLower(confirm) != "y" {
-			fmt.Println("Cancelled"); return
+			fmt.Println("Cancelled")
+			return
 		}
 	} else {
 		fmt.Printf("  OK, %d models found\n", len(models))
@@ -529,7 +534,8 @@ func runAddProvider(path string, providers []provider.Provider, cfg *config.AppC
 
 func runRemoveProvider(path string, providers []provider.Provider) {
 	if len(providers) == 0 {
-		fmt.Println("No providers to remove."); return
+		fmt.Println("No providers to remove.")
+		return
 	}
 	fmt.Println("\n=== Remove Provider ===")
 	for i, p := range providers {
@@ -538,7 +544,8 @@ func runRemoveProvider(path string, providers []provider.Provider) {
 
 	raw := prompt("\nNumbers to remove (comma/space separated): ")
 	if raw == "" {
-		fmt.Println("Cancelled"); return
+		fmt.Println("Cancelled")
+		return
 	}
 
 	parts := strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' })
@@ -550,7 +557,8 @@ func runRemoveProvider(path string, providers []provider.Provider) {
 		}
 	}
 	if len(toRemove) == 0 {
-		fmt.Println("No valid selection"); return
+		fmt.Println("No valid selection")
+		return
 	}
 
 	var names []string
@@ -559,7 +567,8 @@ func runRemoveProvider(path string, providers []provider.Provider) {
 	}
 	confirm := prompt(fmt.Sprintf("Delete %s? (y/N): ", strings.Join(names, ", ")))
 	if strings.ToLower(confirm) != "y" {
-		fmt.Println("Cancelled"); return
+		fmt.Println("Cancelled")
+		return
 	}
 
 	var remaining []provider.Provider

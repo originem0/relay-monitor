@@ -16,6 +16,21 @@ const (
 	BreakerHalfOpen              // cooldown expired, one probe allowed
 )
 
+func (s BreakerState) String() string {
+	switch s {
+	case BreakerHealthy:
+		return "healthy"
+	case BreakerSuspect:
+		return "suspect"
+	case BreakerOpen:
+		return "open"
+	case BreakerHalfOpen:
+		return "half_open"
+	default:
+		return "unknown"
+	}
+}
+
 type breakerEntry struct {
 	mu              sync.Mutex
 	state           BreakerState
@@ -27,10 +42,10 @@ type breakerEntry struct {
 }
 
 const (
-	failureWindow     = 5 * time.Minute
-	suspectThreshold  = 2
-	openThreshold     = 3
-	cooldownDuration  = 60 * time.Second
+	failureWindow    = 5 * time.Minute
+	suspectThreshold = 2
+	openThreshold    = 3
+	cooldownDuration = 60 * time.Second
 )
 
 // Breakers manages per-(provider, model) circuit breaker state.
@@ -87,6 +102,17 @@ func (b *Breakers) AcquireProbe(providerID int64, model string) bool {
 		return true
 	}
 	return false
+}
+
+// ReleaseProbe frees the half-open probe slot without changing breaker state.
+func (b *Breakers) ReleaseProbe(providerID int64, model string) {
+	e := b.getOrCreate(providerID, model)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.state == BreakerHalfOpen {
+		e.probeInProgress = false
+	}
 }
 
 // RecordSuccess marks a successful request. Resets the breaker to HEALTHY.

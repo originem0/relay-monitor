@@ -1,5 +1,6 @@
 {{template "layout.html" .}}
 {{define "content"}}
+<p style="margin:0 0 14px;color:var(--text-dim);font-size:0.9rem">指纹检测不是全量扫表。当前策略是每个站点按厂商选前 3 个候选模型做精确指纹，所以这里的“未抽样”表示站点可用，但这次没被纳入指纹目标。</p>
 <div class="models-toolbar">
     <div class="filter-group">
         <label>厂商</label>
@@ -20,8 +21,8 @@
         <select id="filter-fp" onchange="filterModels()">
             <option value="">全部</option>
             <option value="genuine">GENUINE</option>
-            <option value="has">有结果</option>
-            <option value="none">无结果</option>
+            <option value="has">有精确结果</option>
+            <option value="none">无精确结果</option>
         </select>
     </div>
     <div class="filter-group">
@@ -85,7 +86,7 @@
                                     <td>{{.ProviderName}}</td>
                                     <td>{{if .LatencyMs}}{{printf "%.1f" (divf .LatencyMs 1000.0)}}s{{else}}-{{end}}</td>
                                     <td>{{if .Correct}}<span class="text-ok">&#10003;</span>{{else}}<span class="text-err">&#10007;</span>{{end}}</td>
-                                    <td>{{if .Verdict}}<span class="verdict-{{.VerdictClass}}">{{.Verdict}}</span> <span class="text-dim">({{.FPScore}}/10)</span>{{else}}<span class="text-dim">-</span>{{end}}</td>
+                                    <td>{{if .Verdict}}<span class="verdict-{{.VerdictClass}}">{{.Verdict}}</span> <span class="text-dim">({{.FPScore}}/10)</span>{{else if eq .FPState "sampled"}}<span class="text-dim" title="该站点做过指纹，但当前模型没进入本轮前 3 指纹目标">未抽样</span>{{else}}<span class="text-dim">未运行</span>{{end}}</td>
                                     <td>{{if eq .ToolUse "true"}}<span class="text-ok">&#10003;</span>{{else if eq .ToolUse "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
                                     <td>{{if eq .Streaming "true"}}<span class="text-ok">&#10003;</span>{{else if eq .Streaming "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
                                     <td>

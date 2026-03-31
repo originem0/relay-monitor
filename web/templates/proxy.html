@@ -42,7 +42,7 @@
             <strong style="font-size:1.1rem;color:var(--text-bright)">{{.AvgLatencyMs}}ms</strong>
         </div>
         <div>
-            <div style="font-family:var(--mono);font-size:0.7rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px">可用模型</div>
+            <div style="font-family:var(--mono);font-size:0.7rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px">可路由模型</div>
             <strong style="font-size:1.1rem;color:var(--text-bright)">{{.ModelCount}}</strong>
         </div>
     </div>
@@ -74,8 +74,9 @@
 </div>
 {{end}}
 
-{{if .ProxyProviders}}
-<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">Provider 路由</h3>
+<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">最近 Provider 流量</h3>
+<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.88rem">这张表才表示最近 10 分钟实际被选中并接到请求的 Provider。</p>
+{{if .ProxyTraffic}}
 <div class="table-wrap" style="margin-bottom:24px">
     <table>
         <thead>
@@ -83,11 +84,11 @@
                 <th>Provider</th>
                 <th>请求数</th>
                 <th>错误率</th>
-                <th>路由模型数</th>
+                <th>覆盖模型数</th>
             </tr>
         </thead>
         <tbody>
-            {{range .ProxyProviders}}
+            {{range .ProxyTraffic}}
             <tr>
                 <td>{{.ProviderName}}</td>
                 <td>{{.Requests}}</td>
@@ -98,16 +99,48 @@
         </tbody>
     </table>
 </div>
+{{else if not .ProxyWarming}}
+<div class="card" style="padding:18px 20px;margin-bottom:24px;color:var(--text-dim)">
+    最近 10 分钟暂无 Provider 流量。这个区块会固定显示在覆盖表前面；一旦有请求经过 proxy，这里就会按实际命中顺序出现。
+</div>
 {{end}}
 
-{{if and (not .ProxyModels) (not .ProxyWarming)}}
+{{if .ProxyCoverage}}
+<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">Provider 覆盖</h3>
+<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.88rem">这张表只看路由覆盖范围，不代表当前优先级。权重低、最近没流量的 Provider 也会出现在这里。</p>
+<div class="table-wrap" style="margin-bottom:24px">
+    <table>
+        <thead>
+            <tr>
+                <th>Provider</th>
+                <th>路由模型数</th>
+                <th>最近请求数</th>
+                <th>最近错误率</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .ProxyCoverage}}
+            <tr>
+                <td>{{.ProviderName}}</td>
+                <td>{{.RoutingModels}}</td>
+                <td>{{.Requests}}</td>
+                <td style="font-family:var(--mono)">{{printf "%.1f%%" .ErrorRate}}</td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+</div>
+{{end}}
+
+{{if and (not .ProxyCoverage) (not .ProxyWarming)}}
 <div class="card" style="padding:32px;text-align:center;color:var(--text-dim)">
-    <p>暂无代理请求数据。使用上方的 Endpoint 和 API Key 发送请求。</p>
+    <p>当前路由表为空，暂无可用 Provider。先跑巡检，或者修复站点状态。</p>
 </div>
 {{end}}
 
 {{if .ModelCatalog}}
-<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">可用模型</h3>
+<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">当前可路由模型</h3>
+<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.88rem">这里只显示当前能被 proxy 选中的模型，不等于所有巡检到或已做指纹检测的模型。完整模型列表看模型页。</p>
 <div class="table-wrap" style="margin-bottom:24px">
     <table>
         <thead>

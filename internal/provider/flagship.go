@@ -2,8 +2,15 @@ package provider
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 )
+
+// VendorModel is a ranked model pick for a vendor.
+type VendorModel struct {
+	Vendor string
+	Model  string
+}
 
 // lowKeywords demote a model in flagship selection (smaller/non-chat variants).
 var lowKeywords = []string{
@@ -19,22 +26,96 @@ var highKeywords = []string{
 
 // flagshipScore scores a model for flagship selection.
 // Lower-tier keywords reduce the score; higher-tier keywords increase it.
-func flagshipScore(modelID string) int {
+func flagshipPenalty(modelID string) int {
 	ml := strings.ToLower(modelID)
-	s := 0
 	for _, kw := range lowKeywords {
 		if strings.Contains(ml, kw) {
-			s -= 10
-			break
+			return -10
 		}
 	}
+	return 0
+}
+
+func flagshipBonus(modelID string) int {
+	ml := strings.ToLower(modelID)
 	for _, kw := range highKeywords {
 		if strings.Contains(ml, kw) {
-			s += 5
-			break
+			return 5
 		}
 	}
-	return s
+	return 0
+}
+
+func flagshipScore(modelID string) int {
+	return flagshipPenalty(modelID) + flagshipBonus(modelID)
+}
+
+func numericSignature(modelID string) []int {
+	var nums []int
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() == 0 {
+			return
+		}
+		n, err := strconv.Atoi(cur.String())
+		if err == nil {
+			nums = append(nums, n)
+		}
+		cur.Reset()
+	}
+	for _, ch := range modelID {
+		if ch >= '0' && ch <= '9' {
+			cur.WriteRune(ch)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return nums
+}
+
+func compareNumericSignature(a, b []int) int {
+	limit := len(a)
+	if len(b) < limit {
+		limit = len(b)
+	}
+	for i := 0; i < limit; i++ {
+		if a[i] != b[i] {
+			if a[i] > b[i] {
+				return 1
+			}
+			return -1
+		}
+	}
+	switch {
+	case len(a) > len(b):
+		return 1
+	case len(a) < len(b):
+		return -1
+	default:
+		return 0
+	}
+}
+
+func sortFlagshipCandidates(models []string) {
+	sort.Slice(models, func(i, j int) bool {
+		_, mini := ClassifyTier(models[i])
+		_, minj := ClassifyTier(models[j])
+		if mini != minj {
+			return mini > minj
+		}
+		if pi, pj := flagshipPenalty(models[i]), flagshipPenalty(models[j]); pi != pj {
+			return pi > pj
+		}
+		if cmp := compareNumericSignature(numericSignature(models[i]), numericSignature(models[j])); cmp != 0 {
+			return cmp > 0
+		}
+		si, sj := flagshipBonus(models[i]), flagshipBonus(models[j])
+		if si != sj {
+			return si > sj
+		}
+		return models[i] > models[j]
+	})
 }
 
 // PickFlagships selects one flagship model per vendor from the given model list.
@@ -49,14 +130,45 @@ func PickFlagships(models []string) map[string]string {
 
 	result := make(map[string]string, len(byVendor))
 	for vendor, mlist := range byVendor {
-		sort.Slice(mlist, func(i, j int) bool {
-			si, sj := flagshipScore(mlist[i]), flagshipScore(mlist[j])
-			if si != sj {
-				return si > sj // higher score first
-			}
-			return mlist[i] > mlist[j] // lexicographic descending as tiebreak
-		})
+		sortFlagshipCandidates(mlist)
 		result[vendor] = mlist[0]
+	}
+	return result
+}
+
+// PickTopModelsPerVendor selects up to n best-ranked models per vendor.
+// This is used by fingerprinting to avoid the current one-model-per-vendor blind spot.
+func PickTopModelsPerVendor(models []string, n int) []VendorModel {
+	if n <= 0 {
+		return nil
+	}
+
+	byVendor := make(map[string][]string)
+	for _, m := range models {
+		v := IdentifyVendor(m)
+		byVendor[v] = append(byVendor[v], m)
+	}
+
+	vendors := make([]string, 0, len(byVendor))
+	for vendor := range byVendor {
+		vendors = append(vendors, vendor)
+	}
+	sort.Strings(vendors)
+
+	var result []VendorModel
+	for _, vendor := range vendors {
+		mlist := byVendor[vendor]
+		sortFlagshipCandidates(mlist)
+		limit := n
+		if len(mlist) < limit {
+			limit = len(mlist)
+		}
+		for i := 0; i < limit; i++ {
+			result = append(result, VendorModel{
+				Vendor: vendor,
+				Model:  mlist[i],
+			})
+		}
 	}
 	return result
 }

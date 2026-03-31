@@ -11,14 +11,39 @@ import (
 
 // ScoredProvider is a routing candidate with a computed score.
 type ScoredProvider struct {
-	ProviderID   int64
-	ProviderName string
-	BaseURL      string
-	APIKey       string
-	APIFormat    string // "chat" or "responses"
-	Vendor       string
-	Score        float64
-	LatencyMs    int64
+	ProviderID         int64
+	ProviderName       string
+	BaseURL            string
+	APIKey             string
+	APIFormat          string // "chat" or "responses"
+	Vendor             string
+	Score              float64
+	LatencyMs          int64
+	ChatStreaming      *bool
+	ChatToolUse        *bool
+	ResponsesBasic     *bool
+	ResponsesStreaming *bool
+	ResponsesToolUse   *bool
+}
+
+type RequestRequirements struct {
+	NeedsStreaming bool
+	NeedsTools     bool
+	NeedsToolCall  bool
+}
+
+type rankedCandidate struct {
+	ScoredProvider
+	matchRank int
+}
+
+type DebugCandidate struct {
+	ScoredProvider
+	MatchRank    int
+	BreakerState BreakerState
+	Requests     int64
+	Errors       int64
+	ErrorRate    float64
 }
 
 // RoutingTable maps model names to scored provider lists, rebuilt after each check.
@@ -42,9 +67,15 @@ type FingerprintScore struct {
 
 // Rebuild reconstructs the routing table from the latest check results and provider list.
 // fingerprints maps (providerName, model) to fingerprint scores for quality-based routing.
-func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []store.ProviderRow, memProviders []provider.Provider, fingerprints map[[2]string]FingerprintScore) {
+func (rt *RoutingTable) Rebuild(
+	results []store.CheckResultRow,
+	dbProviders []store.ProviderRow,
+	memProviders []provider.Provider,
+	fingerprints map[[2]string]FingerprintScore,
+	capabilities map[int64]map[string]store.CapabilityRow,
+) {
 	// Build lookup maps
-	keyByName := make(map[string]string)     // provider name → API key
+	keyByName := make(map[string]string)       // provider name → API key
 	priorityByName := make(map[string]float64) // provider name → priority multiplier
 	for _, p := range memProviders {
 		keyByName[p.Name] = p.APIKey
@@ -57,6 +88,12 @@ func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []st
 		healthByID[p.ID] = p.Health
 		statusByID[p.ID] = p.Status
 		formatByID[p.ID] = p.APIFormat
+	}
+
+	// Build URL lookup map (O(1) access, avoids O(N×M) scan in the result loop below)
+	urlByID := make(map[int64]string, len(dbProviders))
+	for _, dp := range dbProviders {
+		urlByID[dp.ID] = dp.BaseURL
 	}
 
 	newModels := make(map[string][]ScoredProvider)
@@ -97,22 +134,29 @@ func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []st
 			score *= pri
 		}
 
+		baseURL, ok2 := urlByID[r.ProviderID]
+		if !ok2 || baseURL == "" {
+			// Provider exists in check results but not in DB — stale record, skip
+			continue
+		}
+
 		sp := ScoredProvider{
 			ProviderID:   r.ProviderID,
 			ProviderName: r.ProviderName,
-			BaseURL:      r.ProviderName, // placeholder, set below
+			BaseURL:      baseURL,
 			APIKey:       apiKey,
 			APIFormat:    formatByID[r.ProviderID],
 			Vendor:       r.Vendor,
 			Score:        score,
 			LatencyMs:    r.LatencyMs,
 		}
-
-		// Get actual BaseURL from DB providers
-		for _, dp := range dbProviders {
-			if dp.ID == r.ProviderID {
-				sp.BaseURL = dp.BaseURL
-				break
+		if caps, ok := capabilities[r.ProviderID]; ok {
+			if cap, ok := caps[r.Model]; ok {
+				sp.ChatStreaming = cap.Streaming
+				sp.ChatToolUse = cap.ToolUse
+				sp.ResponsesBasic = cap.ResponsesBasic
+				sp.ResponsesStreaming = cap.ResponsesStreaming
+				sp.ResponsesToolUse = cap.ResponsesToolUse
 			}
 		}
 
@@ -133,7 +177,134 @@ func (rt *RoutingTable) Rebuild(results []store.CheckResultRow, dbProviders []st
 
 // Select returns an ordered list of providers for the given model and API format.
 // Breaker state and live error rates are applied dynamically at selection time.
-func (rt *RoutingTable) Select(model, apiFormat string, stats *Stats, breakers *Breakers) []ScoredProvider {
+func (rt *RoutingTable) Select(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) []ScoredProvider {
+	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Prefer better capability matches first, then better quality within the same tier.
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].matchRank != candidates[j].matchRank {
+			return candidates[i].matchRank < candidates[j].matchRank
+		}
+		return candidates[i].Score > candidates[j].Score
+	})
+
+	bestRank := candidates[0].matchRank
+	var top []ScoredProvider
+	for _, candidate := range candidates {
+		if candidate.matchRank != bestRank {
+			break
+		}
+		top = append(top, candidate.ScoredProvider)
+		if len(top) == 3 {
+			break
+		}
+	}
+
+	primary := weightedSelect(top)
+
+	// Build result: primary first, then others in score order
+	result := []ScoredProvider{primary}
+	for _, candidate := range candidates {
+		if candidate.ProviderID != primary.ProviderID {
+			result = append(result, candidate.ScoredProvider)
+		}
+	}
+	return result
+}
+
+func (rt *RoutingTable) DebugSelection(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) []DebugCandidate {
+	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers)
+	out := make([]DebugCandidate, len(candidates))
+	for i, candidate := range candidates {
+		debug := DebugCandidate{
+			ScoredProvider: candidate.ScoredProvider,
+			MatchRank:      candidate.matchRank,
+			BreakerState:   BreakerHealthy,
+		}
+		if breakers != nil {
+			debug.BreakerState = breakers.GetState(candidate.ProviderID, model)
+		}
+		if stats != nil {
+			if snap, ok := stats.snapshot(candidate.ProviderID, model); ok {
+				debug.Requests = snap.Requests
+				debug.Errors = snap.Errors
+				if snap.Requests > 0 {
+					debug.ErrorRate = float64(snap.Errors) / float64(snap.Requests)
+				}
+			}
+		}
+		out[i] = debug
+	}
+	return out
+}
+
+func applyRequestRequirements(sp ScoredProvider, requestFormat string, req RequestRequirements) (ScoredProvider, int, bool) {
+	toolUse, streaming, basic := capabilitiesForRequest(sp, requestFormat)
+	matchRank := 0
+
+	if requestFormat == "responses" {
+		switch {
+		case basic != nil && !*basic:
+			return sp, 0, false
+		case basic != nil && *basic && sp.APIFormat == "responses":
+		case basic != nil && *basic:
+			matchRank += 1
+		case sp.APIFormat == "responses":
+			matchRank += 1
+		default:
+			matchRank += 2
+		}
+	}
+
+	if req.NeedsTools {
+		switch {
+		case toolUse != nil && *toolUse:
+		case toolUse != nil && !*toolUse:
+			return sp, 0, false
+		default:
+			if req.NeedsToolCall {
+				matchRank += 3
+			} else {
+				matchRank += 2
+			}
+		}
+	}
+
+	if req.NeedsStreaming {
+		switch {
+		case streaming != nil && !*streaming:
+			return sp, 0, false
+		case streaming == nil:
+			matchRank += 1
+		}
+	}
+
+	return sp, matchRank, true
+}
+
+func capabilitiesForRequest(sp ScoredProvider, requestFormat string) (toolUse, streaming, basic *bool) {
+	if requestFormat == "responses" {
+		return sp.ResponsesToolUse, sp.ResponsesStreaming, sp.ResponsesBasic
+	}
+	return sp.ChatToolUse, sp.ChatStreaming, nil
+}
+
+// applyErrorPenalty adjusts a provider's score based on live proxy error rate.
+// Minimum 5 requests before penalty kicks in (avoid penalizing on noise).
+func applyErrorPenalty(sp ScoredProvider, model string, stats *Stats) float64 {
+	snap, ok := stats.snapshot(sp.ProviderID, model)
+	if !ok || snap.Requests < 5 {
+		return sp.Score
+	}
+	errorRate := float64(snap.Errors) / float64(snap.Requests)
+	// Linear penalty: 10% error rate → score × 0.9, 50% → score × 0.5
+	return sp.Score * (1.0 - errorRate)
+}
+
+func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) []rankedCandidate {
 	rt.mu.RLock()
 	all := rt.models[model]
 	rt.mu.RUnlock()
@@ -142,18 +313,19 @@ func (rt *RoutingTable) Select(model, apiFormat string, stats *Stats, breakers *
 		return nil
 	}
 
-	// Filter by API format, apply breaker + error-rate penalties
-	var candidates []ScoredProvider
+	var candidates []rankedCandidate
 	for _, sp := range all {
 		if !matchFormat(sp.APIFormat, apiFormat) {
 			continue
 		}
-		adjusted := sp
-		// Dynamic circuit breaker check
+		adjusted, rank, ok := applyRequestRequirements(sp, apiFormat, req)
+		if !ok {
+			continue
+		}
 		if breakers != nil {
 			switch breakers.GetState(sp.ProviderID, model) {
 			case BreakerOpen:
-				continue // skip entirely
+				continue
 			case BreakerHalfOpen:
 				adjusted.Score *= 0.3
 			case BreakerSuspect:
@@ -163,47 +335,22 @@ func (rt *RoutingTable) Select(model, apiFormat string, stats *Stats, breakers *
 		if stats != nil {
 			adjusted.Score = applyErrorPenalty(adjusted, model, stats)
 		}
-		candidates = append(candidates, adjusted)
+		candidates = append(candidates, rankedCandidate{
+			ScoredProvider: adjusted,
+			matchRank:      rank,
+		})
 	}
 	if len(candidates) == 0 {
 		return nil
 	}
 
-	// Re-sort by adjusted score
 	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].matchRank != candidates[j].matchRank {
+			return candidates[i].matchRank < candidates[j].matchRank
+		}
 		return candidates[i].Score > candidates[j].Score
 	})
-
-	// Take top 3 for weighted random selection
-	top := candidates
-	if len(top) > 3 {
-		top = top[:3]
-	}
-
-	primary := weightedSelect(top)
-
-	// Build result: primary first, then others in score order
-	result := []ScoredProvider{primary}
-	for _, sp := range candidates {
-		if sp.ProviderID != primary.ProviderID {
-			result = append(result, sp)
-		}
-	}
-	return result
-}
-
-// applyErrorPenalty adjusts a provider's score based on live proxy error rate.
-// Minimum 5 requests before penalty kicks in (avoid penalizing on noise).
-func applyErrorPenalty(sp ScoredProvider, model string, stats *Stats) float64 {
-	v := stats.get(sp.ProviderID, model)
-	reqs := v.Requests.Load()
-	if reqs < 5 {
-		return sp.Score
-	}
-	errs := v.Errors.Load()
-	errorRate := float64(errs) / float64(reqs)
-	// Linear penalty: 10% error rate → score × 0.9, 50% → score × 0.5
-	return sp.Score * (1.0 - errorRate)
+	return candidates
 }
 
 // Models returns a deduplicated list of all model names in the routing table.

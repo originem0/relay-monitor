@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"sort"
 	"strings"
@@ -16,9 +17,10 @@ import (
 
 // Engine orchestrates model testing across providers.
 type Engine struct {
-	Client          *http.Client
-	MaxConcurrency  int
-	RequestInterval time.Duration
+	Client            *http.Client
+	MaxConcurrency    int
+	RequestInterval   time.Duration
+	MaxModelsPerCheck int // 0 = no limit; >0 = randomly sample this many flagships per provider
 }
 
 // CheckMode controls what gets tested.
@@ -98,6 +100,9 @@ func (e *Engine) FetchModels(ctx context.Context, baseURL, apiKey string) ([]str
 // For GPT-5+ models, tries responses API first (OpenAI's default).
 // If any format returns 400, falls back to the other format.
 func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFormat string) *TestResult {
+	// Pick a random question to avoid sending the same prompt to every model
+	q := RandomTestQuestion()
+
 	// GPT-5+ and codex models prefer responses API
 	effectiveFormat := apiFormat
 	if effectiveFormat == "" || effectiveFormat == "chat" {
@@ -107,7 +112,7 @@ func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFor
 		}
 	}
 
-	r, _ := Chat(ctx, e.Client, baseURL, apiKey, modelID, TestPrompt, ChatOptions{
+	r, _ := Chat(ctx, e.Client, baseURL, apiKey, modelID, q.Prompt, ChatOptions{
 		APIFormat:   effectiveFormat,
 		MaxTokens:   200,
 		Temperature: 0,
@@ -119,7 +124,7 @@ func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFor
 		if effectiveFormat == "responses" {
 			altFormat = "chat"
 		}
-		r2, _ := Chat(ctx, e.Client, baseURL, apiKey, modelID, TestPrompt, ChatOptions{
+		r2, _ := Chat(ctx, e.Client, baseURL, apiKey, modelID, q.Prompt, ChatOptions{
 			APIFormat:   altFormat,
 			MaxTokens:   200,
 			Temperature: 0,
@@ -142,7 +147,7 @@ func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFor
 		} else {
 			result.Answer = r.Content
 		}
-		result.Correct = CheckNum(r.Content, CorrectNum, 0.01)
+		result.Correct = CheckNum(r.Content, q.Expected, 0.01)
 		result.HasReasoning = r.Reasoning != ""
 	} else {
 		result.Status = "error"
@@ -185,7 +190,17 @@ func (e *Engine) TestProvider(ctx context.Context, p provider.Provider, mode Che
 			models = append(models, m)
 		}
 		sort.Strings(models)
-		logFn(fmt.Sprintf("%s: %d models found, testing %d flagships", p.Name, len(filtered), len(models)))
+
+		// Cap the number of models tested per run to limit request volume.
+		// When capped, shuffle and take the first N so coverage rotates across runs.
+		if e.MaxModelsPerCheck > 0 && len(models) > e.MaxModelsPerCheck {
+			rand.Shuffle(len(models), func(i, j int) { models[i], models[j] = models[j], models[i] })
+			models = models[:e.MaxModelsPerCheck]
+			sort.Strings(models) // re-sort for stable log output
+			logFn(fmt.Sprintf("%s: %d models found, testing %d/%d flagships (capped)", p.Name, len(filtered), len(models), len(flagships)))
+		} else {
+			logFn(fmt.Sprintf("%s: %d models found, testing %d flagships", p.Name, len(filtered), len(models)))
+		}
 	} else {
 		logFn(fmt.Sprintf("%s: %d models, full test", p.Name, len(models)))
 	}

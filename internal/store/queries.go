@@ -38,6 +38,18 @@ type CheckResultRow struct {
 	CheckedAt    time.Time
 }
 
+// CheckResultInput is the write model for storing a provider test result.
+type CheckResultInput struct {
+	Model        string
+	Vendor       string
+	Status       string
+	Correct      bool
+	Answer       string
+	LatencyMs    int64
+	ErrorMsg     string
+	HasReasoning bool
+}
+
 // EventRow represents an event from the DB.
 type EventRow struct {
 	ID        int64
@@ -113,8 +125,8 @@ func (s *Store) GetProviders() ([]ProviderRow, error) {
 func (s *Store) GetProviderByName(name string) (*ProviderRow, error) {
 	var r ProviderRow
 	var balance sql.NullFloat64
-	err := s.db.QueryRow(`SELECT id, name, base_url, api_format, platform, status, health, last_balance, created_at, updated_at FROM providers WHERE name = ?`, name).
-		Scan(&r.ID, &r.Name, &r.BaseURL, &r.APIFormat, &r.Platform, &r.Status, &r.Health, &balance, &r.CreatedAt, &r.UpdatedAt)
+	err := s.db.QueryRow(`SELECT id, name, base_url, api_format, platform, status, health, last_balance, COALESCE(last_error,''), created_at, updated_at FROM providers WHERE name = ?`, name).
+		Scan(&r.ID, &r.Name, &r.BaseURL, &r.APIFormat, &r.Platform, &r.Status, &r.Health, &balance, &r.LastError, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -136,22 +148,76 @@ func (s *Store) FinishCheckRun(id string, providersCount, modelsCount, okCount, 
 	return err
 }
 
+func (s *Store) AbortCheckRun(id, summary string) error {
+	_, err := s.db.Exec(`UPDATE check_runs SET status = 'aborted', ended_at = datetime('now'), summary = ? WHERE id = ? AND status = 'running'`,
+		summary, id)
+	return err
+}
+
+func (s *Store) AbortRunningCheckRuns(summary string) error {
+	_, err := s.db.Exec(`UPDATE check_runs SET status = 'aborted', ended_at = datetime('now'), summary = ? WHERE status = 'running'`,
+		summary)
+	return err
+}
+
 func (s *Store) InsertCheckResult(runID string, providerID int64, model, vendor, status string, correct bool, answer string, latencyMs int64, errorMsg string, hasReasoning bool) error {
 	_, err := s.db.Exec(`INSERT INTO check_results (run_id, provider_id, model, vendor, status, correct, answer, latency_ms, error_msg, has_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		runID, providerID, model, vendor, status, correct, answer, latencyMs, errorMsg, hasReasoning)
 	return err
 }
 
+// ApplyProviderCheck appends historical results and optionally replaces the provider's
+// current snapshot and provider state atomically.
+func (s *Store) ApplyProviderCheck(runID string, providerID int64, results []CheckResultInput, replaceCurrent bool, updateProviderState bool, providerStatus string, health float64, lastError string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, r := range results {
+		if _, err := tx.Exec(
+			`INSERT INTO check_results (run_id, provider_id, model, vendor, status, correct, answer, latency_ms, error_msg, has_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			runID, providerID, r.Model, r.Vendor, r.Status, r.Correct, r.Answer, r.LatencyMs, r.ErrorMsg, r.HasReasoning,
+		); err != nil {
+			return fmt.Errorf("insert historical result %d/%s: %w", providerID, r.Model, err)
+		}
+	}
+
+	if replaceCurrent {
+		if _, err := tx.Exec(`DELETE FROM current_results WHERE provider_id = ?`, providerID); err != nil {
+			return fmt.Errorf("clear current results %d: %w", providerID, err)
+		}
+		for _, r := range results {
+			if _, err := tx.Exec(
+				`INSERT INTO current_results (provider_id, run_id, model, vendor, status, correct, answer, latency_ms, error_msg, has_reasoning, checked_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+				providerID, runID, r.Model, r.Vendor, r.Status, r.Correct, r.Answer, r.LatencyMs, r.ErrorMsg, r.HasReasoning,
+			); err != nil {
+				return fmt.Errorf("insert current result %d/%s: %w", providerID, r.Model, err)
+			}
+		}
+	}
+
+	if updateProviderState {
+		if _, err := tx.Exec(
+			`UPDATE providers SET status = ?, health = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?`,
+			providerStatus, health, lastError, providerID,
+		); err != nil {
+			return fmt.Errorf("update provider %d status: %w", providerID, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
 // GetLatestResults returns the most recent check result for each provider+model combination.
 func (s *Store) GetLatestResults() ([]CheckResultRow, error) {
 	rows, err := s.db.Query(`
-		SELECT cr.id, cr.run_id, cr.provider_id, p.name, cr.model, cr.vendor, cr.status, cr.correct,
+		SELECT 0 AS id, cr.run_id, cr.provider_id, p.name, cr.model, cr.vendor, cr.status, cr.correct,
 		       COALESCE(cr.answer, ''), cr.latency_ms, COALESCE(cr.error_msg, ''), cr.has_reasoning, cr.checked_at
-		FROM check_results cr
+		FROM current_results cr
 		JOIN providers p ON p.id = cr.provider_id
-		WHERE cr.id IN (
-			SELECT MAX(id) FROM check_results GROUP BY provider_id, model
-		)
 		ORDER BY p.name, cr.model
 	`)
 	if err != nil {
@@ -164,20 +230,26 @@ func (s *Store) GetLatestResults() ([]CheckResultRow, error) {
 // GetProviderResults returns the most recent results for a specific provider.
 func (s *Store) GetProviderResults(providerID int64) ([]CheckResultRow, error) {
 	rows, err := s.db.Query(`
-		SELECT cr.id, cr.run_id, cr.provider_id, p.name, cr.model, cr.vendor, cr.status, cr.correct,
+		SELECT 0 AS id, cr.run_id, cr.provider_id, p.name, cr.model, cr.vendor, cr.status, cr.correct,
 		       COALESCE(cr.answer, ''), cr.latency_ms, COALESCE(cr.error_msg, ''), cr.has_reasoning, cr.checked_at
-		FROM check_results cr
+		FROM current_results cr
 		JOIN providers p ON p.id = cr.provider_id
-		WHERE cr.provider_id = ? AND cr.id IN (
-			SELECT MAX(id) FROM check_results WHERE provider_id = ? GROUP BY model
-		)
+		WHERE cr.provider_id = ?
 		ORDER BY cr.model
-	`, providerID, providerID)
+	`, providerID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanCheckResults(rows)
+}
+
+func (s *Store) CurrentResultsCount() (int, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM current_results`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func scanCheckResults(rows *sql.Rows) ([]CheckResultRow, error) {
@@ -250,6 +322,7 @@ func (s *Store) DeleteProvider(id int64) error {
 
 	stmts := []string{
 		`DELETE FROM check_results WHERE provider_id = ?`,
+		`DELETE FROM current_results WHERE provider_id = ?`,
 		`DELETE FROM fingerprint_results WHERE provider_id = ?`,
 		`DELETE FROM capabilities WHERE provider_id = ?`,
 		`DELETE FROM events WHERE provider = (SELECT name FROM providers WHERE id = ?)`,
@@ -268,13 +341,30 @@ func (s *Store) UpdateProviderPlatform(id int64, platform string) error {
 	return err
 }
 
-func (s *Store) UpsertCapability(providerID int64, model string, streaming, toolUse *bool) error {
+func (s *Store) UpsertCapability(providerID int64, model, apiFormat string, basic, streaming, toolUse *bool) error {
+	if apiFormat == "responses" {
+		_, err := s.db.Exec(`
+			INSERT INTO capabilities (
+				provider_id, model, responses_basic, responses_streaming, responses_tool_use, responses_tested_at, tested_at
+			)
+			VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+			ON CONFLICT(provider_id, model) DO UPDATE SET
+				responses_basic = COALESCE(excluded.responses_basic, capabilities.responses_basic),
+				responses_streaming = COALESCE(excluded.responses_streaming, capabilities.responses_streaming),
+				responses_tool_use = COALESCE(excluded.responses_tool_use, capabilities.responses_tool_use),
+				responses_tested_at = datetime('now'),
+				tested_at = datetime('now')
+		`, providerID, model, basic, streaming, toolUse)
+		return err
+	}
+
 	_, err := s.db.Exec(`
-		INSERT INTO capabilities (provider_id, model, streaming, tool_use, tested_at)
-		VALUES (?, ?, ?, ?, datetime('now'))
+		INSERT INTO capabilities (provider_id, model, streaming, tool_use, chat_tested_at, tested_at)
+		VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
 		ON CONFLICT(provider_id, model) DO UPDATE SET
-			streaming = excluded.streaming,
-			tool_use = excluded.tool_use,
+			streaming = COALESCE(excluded.streaming, capabilities.streaming),
+			tool_use = COALESCE(excluded.tool_use, capabilities.tool_use),
+			chat_tested_at = datetime('now'),
 			tested_at = datetime('now')
 	`, providerID, model, streaming, toolUse)
 	return err
@@ -282,14 +372,23 @@ func (s *Store) UpsertCapability(providerID int64, model string, streaming, tool
 
 // CapabilityRow holds capability data for a model on a provider.
 type CapabilityRow struct {
-	ProviderID int64
-	Model      string
-	Streaming  *bool
-	ToolUse    *bool
+	ProviderID         int64
+	Model              string
+	Streaming          *bool
+	ToolUse            *bool
+	ChatTestedAt       sql.NullTime
+	ResponsesBasic     *bool
+	ResponsesStreaming *bool
+	ResponsesToolUse   *bool
+	ResponsesTestedAt  sql.NullTime
 }
 
 func (s *Store) GetCapabilities(providerID int64) ([]CapabilityRow, error) {
-	rows, err := s.db.Query(`SELECT provider_id, model, streaming, tool_use FROM capabilities WHERE provider_id = ?`, providerID)
+	rows, err := s.db.Query(`
+		SELECT provider_id, model, streaming, tool_use, chat_tested_at, responses_basic, responses_streaming, responses_tool_use, responses_tested_at
+		FROM capabilities
+		WHERE provider_id = ?
+	`, providerID)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +397,17 @@ func (s *Store) GetCapabilities(providerID int64) ([]CapabilityRow, error) {
 	var result []CapabilityRow
 	for rows.Next() {
 		var r CapabilityRow
-		if err := rows.Scan(&r.ProviderID, &r.Model, &r.Streaming, &r.ToolUse); err != nil {
+		if err := rows.Scan(
+			&r.ProviderID,
+			&r.Model,
+			&r.Streaming,
+			&r.ToolUse,
+			&r.ChatTestedAt,
+			&r.ResponsesBasic,
+			&r.ResponsesStreaming,
+			&r.ResponsesToolUse,
+			&r.ResponsesTestedAt,
+		); err != nil {
 			return nil, err
 		}
 		result = append(result, r)
@@ -307,7 +416,10 @@ func (s *Store) GetCapabilities(providerID int64) ([]CapabilityRow, error) {
 }
 
 func (s *Store) GetAllCapabilities() (map[int64]map[string]CapabilityRow, error) {
-	rows, err := s.db.Query(`SELECT provider_id, model, streaming, tool_use FROM capabilities`)
+	rows, err := s.db.Query(`
+		SELECT provider_id, model, streaming, tool_use, chat_tested_at, responses_basic, responses_streaming, responses_tool_use, responses_tested_at
+		FROM capabilities
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +428,17 @@ func (s *Store) GetAllCapabilities() (map[int64]map[string]CapabilityRow, error)
 	result := make(map[int64]map[string]CapabilityRow)
 	for rows.Next() {
 		var r CapabilityRow
-		if err := rows.Scan(&r.ProviderID, &r.Model, &r.Streaming, &r.ToolUse); err != nil {
+		if err := rows.Scan(
+			&r.ProviderID,
+			&r.Model,
+			&r.Streaming,
+			&r.ToolUse,
+			&r.ChatTestedAt,
+			&r.ResponsesBasic,
+			&r.ResponsesStreaming,
+			&r.ResponsesToolUse,
+			&r.ResponsesTestedAt,
+		); err != nil {
 			return nil, err
 		}
 		if result[r.ProviderID] == nil {
@@ -329,19 +451,19 @@ func (s *Store) GetAllCapabilities() (map[int64]map[string]CapabilityRow, error)
 
 // FingerprintRow represents a fingerprint result joined with provider info.
 type FingerprintRow struct {
-	ID            int64
-	ProviderID    int64
-	ProviderName  string
-	Model         string
-	Vendor        string
-	TotalScore    int
+	ID             int64
+	ProviderID     int64
+	ProviderName   string
+	Model          string
+	Vendor         string
+	TotalScore     int
 	L1, L2, L3, L4 int
-	ExpectedTier  string
-	ExpectedMin   int
-	Verdict       string
-	SelfIDVerdict string
-	SelfIDDetail  string
-	CheckedAt     time.Time
+	ExpectedTier   string
+	ExpectedMin    int
+	Verdict        string
+	SelfIDVerdict  string
+	SelfIDDetail   string
+	CheckedAt      time.Time
 }
 
 func (s *Store) InsertFingerprintResult(providerID int64, model, vendor string, totalScore, l1, l2, l3, l4 int, expectedTier string, expectedMin int, verdict, selfIDVerdict, selfIDDetail, answersJSON string) error {

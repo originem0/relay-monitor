@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS check_results (
 CREATE INDEX IF NOT EXISTS idx_cr_prov_model ON check_results(provider_id, model, checked_at);
 CREATE INDEX IF NOT EXISTS idx_cr_run ON check_results(run_id);
 
+CREATE TABLE IF NOT EXISTS current_results (
+    provider_id   INTEGER NOT NULL REFERENCES providers(id),
+    run_id        TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    vendor        TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    correct       BOOLEAN DEFAULT 0,
+    answer        TEXT,
+    latency_ms    INTEGER NOT NULL,
+    error_msg     TEXT,
+    has_reasoning BOOLEAN DEFAULT 0,
+    checked_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider_id, model)
+);
+CREATE INDEX IF NOT EXISTS idx_cur_run ON current_results(run_id);
+
 CREATE TABLE IF NOT EXISTS fingerprint_results (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     provider_id     INTEGER NOT NULL REFERENCES providers(id),
@@ -64,6 +80,11 @@ CREATE TABLE IF NOT EXISTS capabilities (
     model       TEXT NOT NULL,
     streaming   BOOLEAN,
     tool_use    BOOLEAN,
+    chat_tested_at      DATETIME,
+    responses_basic     BOOLEAN,
+    responses_streaming BOOLEAN,
+    responses_tool_use  BOOLEAN,
+    responses_tested_at DATETIME,
     tested_at   DATETIME,
     PRIMARY KEY (provider_id, model)
 );

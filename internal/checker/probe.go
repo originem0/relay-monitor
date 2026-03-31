@@ -1,10 +1,37 @@
 package checker
 
-import "strings"
+import (
+	"math/rand"
+	"strings"
+)
 
-// Basic test probe — the chicken-and-rabbit problem.
+// Basic test probe — the chicken-and-rabbit problem (kept for CLI display + fingerprint L1).
 const TestPrompt = "A farm has 17 chickens and 23 rabbits. How many legs in total? Answer with only the number."
 const CorrectNum = 126
+
+// TestQuestion pairs a prompt with its expected numerical answer.
+type TestQuestion struct {
+	Prompt   string
+	Expected float64
+}
+
+// TestPromptPool provides varied arithmetic prompts so each request uses a different
+// question, avoiding the "same prompt to N models" pattern that triggers anti-abuse detection.
+var TestPromptPool = []TestQuestion{
+	{TestPrompt, CorrectNum},
+	{"A store has 15 boxes with 8 items each and 9 boxes with 12 items each. How many items in total? Answer with only the number.", 228},
+	{"A rectangle has a length of 17 cm and a width of 9 cm. What is its perimeter in cm? Answer with only the number.", 52},
+	{"If you have 3 quarters, 7 dimes, and 4 nickels, how many cents do you have in total? Answer with only the number.", 165},
+	{"A train travels at 60 km/h for 2.5 hours, then at 80 km/h for 1.5 hours. What is the total distance in km? Answer with only the number.", 270},
+	{"A classroom has 6 rows of 5 desks. If 7 desks are removed, how many remain? Answer with only the number.", 23},
+	{"A book has 12 chapters. The first 5 have 20 pages each, the rest have 15 pages each. How many pages total? Answer with only the number.", 205},
+	{"A parking lot has 4 levels. Each level has 3 rows of 25 spaces. How many parking spaces in total? Answer with only the number.", 300},
+}
+
+// RandomTestQuestion picks a random question from the pool.
+func RandomTestQuestion() TestQuestion {
+	return TestPromptPool[rand.Intn(len(TestPromptPool))]
+}
 
 // FingerprintQuestion defines one item in the 10-question capability fingerprint.
 type FingerprintQuestion struct {

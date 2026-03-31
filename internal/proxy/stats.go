@@ -12,6 +12,7 @@ type statsKey struct {
 }
 
 type statsValue struct {
+	mu           sync.Mutex // guards window reset; atomics used for reads outside reset
 	Requests     atomic.Int64
 	Errors       atomic.Int64
 	TotalLatency atomic.Int64 // milliseconds
@@ -27,6 +28,27 @@ type StatsSnapshot struct {
 	Requests     int64
 	Errors       int64
 	AvgLatencyMs int64
+}
+
+func (s *Stats) snapshot(providerID int64, model string) (StatsSnapshot, bool) {
+	s.mu.RLock()
+	v, ok := s.counters[statsKey{ProviderID: providerID, Model: model}]
+	s.mu.RUnlock()
+	if !ok {
+		return StatsSnapshot{}, false
+	}
+
+	reqs := v.Requests.Load()
+	snap := StatsSnapshot{
+		ProviderID: providerID,
+		Model:      model,
+		Requests:   reqs,
+		Errors:     v.Errors.Load(),
+	}
+	if reqs > 0 {
+		snap.AvgLatencyMs = v.TotalLatency.Load() / reqs
+	}
+	return snap, true
 }
 
 // Stats tracks per-(provider, model) proxy request counters in memory.
@@ -65,22 +87,21 @@ func (s *Stats) get(providerID int64, model string) *statsValue {
 func (s *Stats) Record(providerID int64, model string, latencyMs int64, isError bool) {
 	v := s.get(providerID, model)
 
-	// Reset window if expired — prevents stale error rates from lingering forever
-	oldStart := v.windowStart.Load()
-	if time.Since(time.Unix(oldStart, 0)) > statsWindowDuration {
-		newStart := time.Now().Unix()
-		if v.windowStart.CompareAndSwap(oldStart, newStart) {
-			v.Requests.Store(0)
-			v.Errors.Store(0)
-			v.TotalLatency.Store(0)
-		}
+	// Reset window under lock to avoid the CAS-then-Store(0) race where a
+	// concurrent Add(1) lands between CompareAndSwap and Store(0) and gets wiped.
+	v.mu.Lock()
+	if time.Since(time.Unix(v.windowStart.Load(), 0)) > statsWindowDuration {
+		v.Requests.Store(0)
+		v.Errors.Store(0)
+		v.TotalLatency.Store(0)
+		v.windowStart.Store(time.Now().Unix())
 	}
-
 	v.Requests.Add(1)
 	v.TotalLatency.Add(latencyMs)
 	if isError {
 		v.Errors.Add(1)
 	}
+	v.mu.Unlock()
 }
 
 // Snapshot returns a copy of all current counters.
@@ -91,16 +112,17 @@ func (s *Stats) Snapshot() []StatsSnapshot {
 	out := make([]StatsSnapshot, 0, len(s.counters))
 	for k, v := range s.counters {
 		reqs := v.Requests.Load()
-		snap := StatsSnapshot{
-			ProviderID: k.ProviderID,
-			Model:      k.Model,
-			Requests:   reqs,
-			Errors:     v.Errors.Load(),
-		}
+		avgLatency := int64(0)
 		if reqs > 0 {
-			snap.AvgLatencyMs = v.TotalLatency.Load() / reqs
+			avgLatency = v.TotalLatency.Load() / reqs
 		}
-		out = append(out, snap)
+		out = append(out, StatsSnapshot{
+			ProviderID:   k.ProviderID,
+			Model:        k.Model,
+			Requests:     reqs,
+			Errors:       v.Errors.Load(),
+			AvgLatencyMs: avgLatency,
+		})
 	}
 	return out
 }

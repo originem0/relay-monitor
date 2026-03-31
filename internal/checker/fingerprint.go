@@ -193,7 +193,9 @@ func JudgeSelfID(modelID, answer string) (verdict, detail string) {
 	return "UNCLEAR", "no vendor keyword mapping for this model"
 }
 
-// RunFingerprintAll runs fingerprint on the given provider's flagship models.
+const fingerprintModelsPerVendor = 3
+
+// RunFingerprintAll runs fingerprint on the given provider's top-ranked models.
 // Returns results for each model tested.
 func (e *Engine) RunFingerprintAll(ctx context.Context, client *http.Client, p provider.Provider, logFn func(string)) []*FingerprintResult {
 	models, err := e.FetchModels(ctx, p.BaseURL, p.APIKey)
@@ -209,24 +211,22 @@ func (e *Engine) RunFingerprintAll(ctx context.Context, client *http.Client, p p
 		}
 	}
 
-	flagships := provider.PickFlagships(filtered)
-	logFn(fmt.Sprintf("[fingerprint] %s: %d models, testing %d flagships", p.Name, len(filtered), len(flagships)))
+	targets := provider.PickTopModelsPerVendor(filtered, fingerprintModelsPerVendor)
+	logFn(fmt.Sprintf("[fingerprint] %s: %d models, testing %d top targets (%d per vendor)", p.Name, len(filtered), len(targets), fingerprintModelsPerVendor))
 
 	var results []*FingerprintResult
-	i := 0
-	for vendor, mid := range flagships {
+	for i, target := range targets {
 		if ctx.Err() != nil {
 			break
 		}
-		i++
-		logFn(fmt.Sprintf("[fingerprint] %s [%d/%d] %s (%s)...", p.Name, i, len(flagships), mid, vendor))
+		logFn(fmt.Sprintf("[fingerprint] %s [%d/%d] %s (%s)...", p.Name, i+1, len(targets), target.Model, target.Vendor))
 
-		fr := e.FingerprintModel(ctx, p.BaseURL, p.APIKey, mid, p.APIFormat)
+		fr := e.FingerprintModel(ctx, p.BaseURL, p.APIKey, target.Model, p.APIFormat)
 		fr.Provider = p.Name
 		results = append(results, fr)
 
 		log.Printf("[fingerprint] %s %s → %s (score %d/%d, self-id: %s)",
-			p.Name, mid, fr.Verdict, fr.TotalScore, fr.ExpectedMin, fr.SelfID.Verdict)
+			p.Name, target.Model, fr.Verdict, fr.TotalScore, fr.ExpectedMin, fr.SelfID.Verdict)
 	}
 
 	return results
