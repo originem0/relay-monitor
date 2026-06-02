@@ -5,10 +5,18 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
+	"time"
 
 	"relay-monitor/internal/provider"
 	"relay-monitor/internal/store"
 )
+
+// maxRoutableAge bounds how stale a check result may be and still feed the
+// routing table. Beyond it the snapshot is a zombie — the station likely went
+// dark or dropped the model — so it's excluded and the proxy never routes on
+// weeks-old "available" data. The front-end flags such rows as stale, and the
+// run-time breaker is a second line of defense. Mirrors store.maxStaleAge.
+const maxRoutableAge = 48 * time.Hour
 
 // ScoredProvider is a routing candidate with a computed score.
 type ScoredProvider struct {
@@ -109,6 +117,12 @@ func (rt *RoutingTable) Rebuild(
 	for _, r := range results {
 		// Hard filter: the individual model check must have passed
 		if !r.Correct || r.Status != "ok" {
+			continue
+		}
+
+		// Zombie filter: a result not successfully re-checked within maxRoutableAge
+		// is stale (station went dark / dropped the model); don't route on it.
+		if !r.CheckedAt.IsZero() && time.Since(r.CheckedAt) > maxRoutableAge {
 			continue
 		}
 

@@ -17,6 +17,7 @@
         <div class="provider-stats">
             <span><span class="stat-value">{{.ModelsOK}}/{{.ModelsTotal}}</span> 正确</span>
             <span>延迟 <span class="stat-value">{{if .AvgLatencyMs}}{{printf "%.1f" .AvgLatencyMs}}s{{else}}-{{end}}</span></span>
+            <span>检测 <span class="stat-value{{if isStale .CheckedAt}} text-err{{end}}">{{relTime .CheckedAt}}{{if isStale .CheckedAt}} &#9888;{{end}}</span></span>
             {{if .Balance}}<span>余额 <span class="stat-value">${{printf "%.2f" (quota2usd (deref .Balance))}}</span></span>{{else if .HasAccessToken}}<span class="text-err">余额获取失败</span>{{end}}
         </div>
         <div style="display:flex;align-items:center;gap:8px;margin-top:4px">

@@ -38,6 +38,11 @@ const (
 func (e *Engine) FetchModels(ctx context.Context, baseURL, apiKey string) ([]string, error) {
 	url := strings.TrimRight(baseURL, "/") + "/models"
 
+	// Bound model-list discovery so a dead station (DNS/SSL/refused/no response)
+	// can't stall a whole provider's check for minutes.
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
 	noRetry := map[int]bool{401: true, 403: true, 404: true}
 	var lastErr string
 
@@ -55,11 +60,10 @@ func (e *Engine) FetchModels(ctx context.Context, baseURL, apiKey string) ([]str
 
 		resp, err := e.Client.Do(req)
 		if err != nil {
-			lastErr = DiagnoseError(0, err.Error(), apiKey)
-			if attempt < 2 {
-				time.Sleep(2 * time.Second)
-			}
-			continue
+			// Connection-level failures (DNS, SSL, refused, ctx timeout) are almost
+			// always persistent for a dead station — fail fast instead of burning
+			// 3x the timeout retrying.
+			return nil, fmt.Errorf("%s", DiagnoseError(0, err.Error(), apiKey))
 		}
 
 		body, _ := io.ReadAll(resp.Body)

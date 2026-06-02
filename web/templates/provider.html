@@ -101,6 +101,7 @@
                 <th>延迟</th>
                 <th>结果</th>
                 <th>错误</th>
+                <th>检测</th>
             </tr>
         </thead>
         <tbody>
@@ -112,6 +113,7 @@
                 <td>{{if .LatencyMs}}{{printf "%.1f" (divf .LatencyMs 1000.0)}}s{{else}}-{{end}}</td>
                 <td>{{if eq .Status "untested"}}<span class="text-dim">未测试</span>{{else if eq .Status "ok"}}{{if .Correct}}<span class="text-ok">正确</span>{{else}}<span class="text-warn">错误答案</span>{{end}}{{else}}<span class="text-err">失败</span>{{end}}</td>
                 <td>{{if .Error}}<span class="model-error">{{.Error}}</span>{{end}}</td>
+                <td class="text-dim{{if isStale .CheckedAt}} text-err{{end}}">{{relTime .CheckedAt}}</td>
             </tr>
             {{end}}
         </tbody>

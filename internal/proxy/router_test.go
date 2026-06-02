@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"testing"
+	"time"
 
 	"relay-monitor/internal/provider"
 	"relay-monitor/internal/store"
@@ -590,6 +591,32 @@ func TestSelectWithExplanation_CapabilityFilteredShown(t *testing.T) {
 	}
 	if filtered[0].ReasonCode != "capability_unsupported" {
 		t.Errorf("expected reason = capability_unsupported, got %s", filtered[0].ReasonCode)
+	}
+}
+
+func TestRebuildExcludesStaleResults(t *testing.T) {
+	rt := NewRoutingTable()
+	now := time.Now()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "fresh", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000, CheckedAt: now.Add(-1 * time.Hour)},
+		{ProviderID: 2, ProviderName: "zombie", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000, CheckedAt: now.Add(-49 * time.Hour)},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "fresh", BaseURL: "https://f.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+		{ID: 2, Name: "zombie", BaseURL: "https://z.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "fresh", APIKey: "k1"},
+		{Name: "zombie", APIKey: "k2"},
+	}
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
+
+	candidates := rt.Select("m1", "chat", RequestRequirements{}, nil, nil)
+	if len(candidates) != 1 {
+		t.Fatalf("expected only fresh (zombie >48h excluded), got %d", len(candidates))
+	}
+	if candidates[0].ProviderName != "fresh" {
+		t.Errorf("routable = %s, want fresh (stale zombie excluded)", candidates[0].ProviderName)
 	}
 }
 

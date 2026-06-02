@@ -409,6 +409,7 @@ type ProviderCard struct {
 	ErrorMsg       string
 	Disabled       bool
 	RoutePaused    bool
+	CheckedAt      time.Time
 }
 
 // EventItem is the view model for an event in the list.
@@ -429,6 +430,7 @@ type ModelRow struct {
 	Correct   bool
 	LatencyMs int64
 	Error     string
+	CheckedAt time.Time
 }
 
 // ModelGroup is the view model for a model row in the models page.
@@ -460,6 +462,9 @@ type ModelProviderRow struct {
 	Streaming    string
 	IsBest       bool
 	CCCompat     bool // Claude Code compatible: claude model + tool_use + streaming
+	Status       string
+	ErrorMsg     string
+	CheckedAt    time.Time
 }
 
 type pageData struct {
@@ -519,6 +524,25 @@ func New(cfg *config.AppConfig, st *store.Store, eng *checker.Engine, providers 
 		},
 		"quota2usd": func(q float64) float64 {
 			return q / 500000.0
+		},
+		"relTime": func(t time.Time) string {
+			if t.IsZero() {
+				return "未检测"
+			}
+			d := time.Since(t)
+			switch {
+			case d < time.Minute:
+				return "刚刚"
+			case d < time.Hour:
+				return fmt.Sprintf("%d分钟前", int(d.Minutes()))
+			case d < 24*time.Hour:
+				return fmt.Sprintf("%d小时前", int(d.Hours()))
+			default:
+				return fmt.Sprintf("%d天前", int(d.Hours()/24))
+			}
+		},
+		"isStale": func(t time.Time) bool {
+			return !t.IsZero() && time.Since(t) > 48*time.Hour
 		},
 	}
 
@@ -857,6 +881,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 					totalLatency += cr.LatencyMs
 					latencyCount++
 				}
+				if cr.CheckedAt.After(card.CheckedAt) {
+					card.CheckedAt = cr.CheckedAt
+				}
 			}
 			if latencyCount > 0 {
 				card.AvgLatencyMs = float64(totalLatency) / float64(latencyCount) / 1000.0
@@ -929,6 +956,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		latencyMs    int64
 		correct      bool
 		status       string
+		errorMsg     string
+		checkedAt    time.Time
 	}
 	grouped := make(map[modelKey][]provResult)
 	var order []modelKey
@@ -951,6 +980,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			latencyMs:    cr.LatencyMs,
 			correct:      cr.Correct,
 			status:       cr.Status,
+			errorMsg:     cr.ErrorMsg,
+			checkedAt:    cr.CheckedAt,
 		})
 	}
 
@@ -997,6 +1028,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 				LatencyMs:    pr.latencyMs,
 				Correct:      pr.correct,
 				IsBest:       pr.providerName == mg.BestProvider,
+				Status:       pr.status,
+				ErrorMsg:     pr.errorMsg,
+				CheckedAt:    pr.checkedAt,
 			}
 			// Fill capabilities from DB
 			if caps, ok := allCaps[pr.providerID]; ok {
@@ -1148,6 +1182,7 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 			row.Correct = cr.Correct
 			row.LatencyMs = cr.LatencyMs
 			row.Error = cr.ErrorMsg
+			row.CheckedAt = cr.CheckedAt
 		}
 		data.Models = append(data.Models, row)
 	}
