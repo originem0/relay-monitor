@@ -118,8 +118,11 @@ func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFor
 		Temperature: 0,
 	})
 
-	// If failed with 400/500, try the other format
-	if !r.OK && (r.Code == 400 || r.Code == 500) {
+	// If failed, try the other format. 404 is included so a model that's gone on
+	// the preferred wire format (e.g. responses) still gets checked on the other
+	// (chat) before being declared dead — capability probing records which format
+	// actually works so routing can stay format-aware.
+	if !r.OK && (r.Code == 400 || r.Code == 404 || r.Code == 500) {
 		altFormat := "responses"
 		if effectiveFormat == "responses" {
 			altFormat = "chat"

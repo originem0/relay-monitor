@@ -58,7 +58,7 @@ func shouldProbeResponsesCapability(model, providerFormat string) bool {
 }
 
 const capabilityRefreshInterval = 24 * time.Hour
-const capabilityProbeLimit = 3
+const capabilityProbeLimit = 6
 
 type capabilityProbeTarget struct {
 	Result        checker.TestResult
@@ -287,14 +287,8 @@ func (s *Server) rebuildProxyTable(memProviders []provider.Provider) {
 	s.proxyRebuildMu.Lock()
 	defer s.proxyRebuildMu.Unlock()
 
-	// Exclude disabled providers from routing
-	var active []provider.Provider
-	for _, p := range memProviders {
-		if !p.Disabled {
-			active = append(active, p)
-		}
-	}
-
+	// Disabled/route-paused exclusion now lives inside RebuildTable (router),
+	// so every caller — including main.go's startup rebuild — gets it for free.
 	results, err := s.store.GetLatestResults()
 	if err != nil {
 		log.Printf("[proxy] rebuild skipped: failed to load results: %v", err)
@@ -309,7 +303,7 @@ func (s *Server) rebuildProxyTable(memProviders []provider.Provider) {
 	if err != nil {
 		log.Printf("[proxy] rebuild: capabilities load failed (proceeding without): %v", err)
 	}
-	s.proxy.RebuildTable(results, dbProviders, active, s.buildFingerprintMap(), caps)
+	s.proxy.RebuildTable(results, dbProviders, memProviders, s.buildFingerprintMap(), caps)
 }
 
 func checkRunModeLabel(mode checker.CheckMode) string {
@@ -414,6 +408,7 @@ type ProviderCard struct {
 	Note           string
 	ErrorMsg       string
 	Disabled       bool
+	RoutePaused    bool
 }
 
 // EventItem is the view model for an event in the list.
@@ -487,6 +482,7 @@ type pageData struct {
 		AccessToken string
 		Priority    float64
 		Disabled    bool
+		RoutePaused bool
 	}
 	Models []ModelRow
 	// Models view
@@ -581,6 +577,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("DELETE /api/v1/providers/{name}", s.handleDeleteProvider)
 	mux.HandleFunc("POST /api/v1/providers/{name}/pin", s.handleTogglePin)
 	mux.HandleFunc("POST /api/v1/providers/{name}/disable", s.handleToggleDisable)
+	mux.HandleFunc("POST /api/v1/providers/{name}/pause", s.handleTogglePause)
 	mux.HandleFunc("POST /api/v1/providers/{name}/note", s.handleUpdateNote)
 	mux.HandleFunc("POST /api/v1/providers/{name}/edit", s.handleEditProvider)
 	mux.HandleFunc("GET /api/v1/status", s.handleGetStatus)
@@ -846,6 +843,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			card.Note = meta.Note
 			card.HasAccessToken = meta.AccessToken != ""
 			card.Disabled = meta.Disabled
+			card.RoutePaused = meta.RoutePaused
 		}
 		if results, ok := provResults[dp.ID]; ok {
 			card.ModelsTotal = len(results)
@@ -1081,6 +1079,7 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		AccessToken string
 		Priority    float64
 		Disabled    bool
+		RoutePaused bool
 	}{
 		Name:   dp.Name,
 		Status: dp.Status,
@@ -1094,6 +1093,7 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		data.Provider.AccessToken = provMeta.AccessToken
 		data.Provider.Priority = provMeta.Priority
 		data.Provider.Disabled = provMeta.Disabled
+		data.Provider.RoutePaused = provMeta.RoutePaused
 	}
 
 	// Get stored test results for this provider
@@ -1396,24 +1396,37 @@ func (s *Server) RunFingerprintAndStore(ctx context.Context, provs []provider.Pr
 		if ctx.Err() != nil {
 			break
 		}
+		// Skip disabled providers — fingerprinting follows the same "enabled checks"
+		// gate as RunCheckAndStore. Route-paused providers ARE still fingerprinted so
+		// their recovery stays monitored.
+		if p.Disabled {
+			s.sseHub.Publish(SSEEvent{Type: "check_progress", Data: fmt.Sprintf("[%d/%d] %s 已禁用，跳过", i+1, len(provs), p.Name)})
+			continue
+		}
 		s.sseHub.Publish(SSEEvent{Type: "check_progress", Data: fmt.Sprintf("[%d/%d] %s 指纹检测中...", i+1, len(provs), p.Name)})
 		results := s.engine.RunFingerprintAll(ctx, s.engine.Client, p, logFn)
 		pid, ok := provIDs[p.Name]
 		if !ok {
+			log.Printf("[fingerprint] %s: no DB id (upsert failed earlier?), skipping store of %d results", p.Name, len(results))
 			continue
 		}
+		stored := 0
 		for _, fr := range results {
 			answersJSON, _ := json.Marshal(fr.Answers)
 			l1 := fr.Scores["L1"]
 			l2 := fr.Scores["L2"]
 			l3 := fr.Scores["L3"]
 			l4 := fr.Scores["L4"]
-			s.store.InsertFingerprintResult(pid, fr.Model, fr.Vendor,
+			if err := s.store.InsertFingerprintResult(pid, fr.Model, fr.Vendor,
 				fr.TotalScore, l1[0], l2[0], l3[0], l4[0],
 				fr.ExpectedTier, fr.ExpectedMin, fr.Verdict,
-				fr.SelfID.Verdict, fr.SelfID.Detail, string(answersJSON))
+				fr.SelfID.Verdict, fr.SelfID.Detail, string(answersJSON)); err != nil {
+				log.Printf("[fingerprint] store %s/%s failed: %v", p.Name, fr.Model, err)
+				continue
+			}
+			stored++
 		}
-		s.sseHub.Publish(SSEEvent{Type: "provider_done", Data: fmt.Sprintf("%s 指纹完成 (%d 模型)", p.Name, len(results))})
+		s.sseHub.Publish(SSEEvent{Type: "provider_done", Data: fmt.Sprintf("%s 指纹完成 (%d/%d 模型已存)", p.Name, stored, len(results))})
 	}
 
 	// Rebuild proxy routing table with updated fingerprint scores
@@ -1610,6 +1623,28 @@ func (s *Server) handleToggleDisable(w http.ResponseWriter, r *http.Request) {
 	for i, p := range s.providers {
 		if p.Name == name {
 			s.providers[i].Disabled = !s.providers[i].Disabled
+			break
+		}
+	}
+	provs := make([]provider.Provider, len(s.providers))
+	copy(provs, s.providers)
+	s.mu.Unlock()
+	config.SaveProviders(s.cfg.ProvidersFile, provs)
+	s.rebuildProxyTable(provs)
+	w.Header().Set("HX-Redirect", "/provider/"+url.PathEscape(name))
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleTogglePause toggles RoutePaused: the provider stays in the check
+// rotation (so its recovery is still monitored) but is excluded from proxy
+// routing. This is the "stop using this site" control, distinct from
+// handleToggleDisable which stops both checks AND routing.
+func (s *Server) handleTogglePause(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	s.mu.Lock()
+	for i, p := range s.providers {
+		if p.Name == name {
+			s.providers[i].RoutePaused = !s.providers[i].RoutePaused
 			break
 		}
 	}

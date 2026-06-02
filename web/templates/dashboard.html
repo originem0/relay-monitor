@@ -6,10 +6,10 @@
 </div>
 <div class="provider-grid" id="provider-grid">
     {{range .Providers}}
-    <a href="/provider/{{.Name}}" class="provider-card{{if .Pinned}} pinned{{end}}{{if .Disabled}} disabled{{end}}" data-name="{{.Name}}" data-url="{{.URL}}"{{if .Disabled}} style="opacity:0.5"{{end}}>
+    <a href="/provider/{{.Name}}" class="provider-card{{if .Pinned}} pinned{{end}}{{if .Disabled}} disabled{{end}}" data-name="{{.Name}}" data-url="{{.URL}}"{{if or .Disabled .RoutePaused}} style="opacity:0.5"{{end}}>
         <div class="provider-card-header">
             {{if .Pinned}}<span class="pin-icon" title="已置顶">&#9733;</span>{{end}}
-            {{if .Disabled}}<span style="font-size:0.7rem;color:var(--error);margin-right:4px" title="已禁用">&#9940;</span>{{else}}<span class="status-dot status-{{.Status}}"></span>{{end}}
+            {{if .Disabled}}<span style="font-size:0.7rem;color:var(--error);margin-right:4px" title="已禁用">&#9940;</span>{{else if .RoutePaused}}<span style="font-size:0.7rem;margin-right:4px" title="已停用路由（仍在巡检）">&#9208;</span>{{else}}<span class="status-dot status-{{.Status}}"></span>{{end}}
             <span class="provider-name">{{.Name}}</span>
             {{if and .Platform (ne .Platform "unknown")}}<span class="platform-tag">{{.Platform}}</span>{{end}}
         </div>

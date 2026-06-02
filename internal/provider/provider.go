@@ -14,8 +14,9 @@ type Provider struct {
 	LastKnownQuota float64 `json:"last_known_quota,omitempty"`
 	Pinned         bool    `json:"pinned,omitempty"`
 	Note           string  `json:"note,omitempty"`
-	Priority       float64 `json:"priority,omitempty"` // routing multiplier: 0=default(1.0), 2.0=double score
-	Disabled       bool    `json:"disabled,omitempty"` // skip checks and routing when true
+	Priority       float64 `json:"priority,omitempty"`     // routing multiplier: 0=default(1.0), 2.0=double score
+	Disabled       bool    `json:"disabled,omitempty"`     // skip checks AND routing when true (full stop)
+	RoutePaused    bool    `json:"route_paused,omitempty"` // skip routing only; keep probing so recovery stays monitored
 }
 
 // vendorPattern maps a keyword (matched case-insensitively) to a vendor name.

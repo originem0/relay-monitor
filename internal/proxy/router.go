@@ -80,6 +80,12 @@ func (rt *RoutingTable) Rebuild(
 	keyByName := make(map[string]string)       // provider name → API key
 	priorityByName := make(map[string]float64) // provider name → priority multiplier
 	for _, p := range memProviders {
+		// Disabled or route-paused providers are not routable — keep them out of
+		// the table entirely. Doing it here (rather than in callers) means every
+		// rebuild path, including main.go's startup load, excludes them.
+		if p.Disabled || p.RoutePaused {
+			continue
+		}
 		keyByName[p.Name] = p.APIKey
 		priorityByName[p.Name] = p.Priority
 	}
@@ -205,7 +211,7 @@ func (rt *RoutingTable) Rebuild(
 // Select returns an ordered list of providers for the given model and API format.
 // Breaker state and live error rates are applied dynamically at selection time.
 func (rt *RoutingTable) Select(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) []ScoredProvider {
-	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers, nil)
+	candidates, _ := rt.rankedCandidates(model, apiFormat, req, stats, breakers, nil)
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -243,7 +249,7 @@ func (rt *RoutingTable) Select(model, apiFormat string, req RequestRequirements,
 }
 
 func (rt *RoutingTable) DebugSelection(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) []DebugCandidate {
-	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers, nil)
+	candidates, _ := rt.rankedCandidates(model, apiFormat, req, stats, breakers, nil)
 	out := make([]DebugCandidate, len(candidates))
 	for i, candidate := range candidates {
 		debug := DebugCandidate{
@@ -338,16 +344,17 @@ type selectionExplanation struct {
 	Filtered []FilteredEntry
 }
 
-func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers, explain *selectionExplanation) []rankedCandidate {
+func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers, explain *selectionExplanation) ([]rankedCandidate, *rankedCandidate) {
 	rt.mu.RLock()
 	all := rt.models[model]
 	rt.mu.RUnlock()
 
 	if len(all) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var candidates []rankedCandidate
+	var bestOpen *rankedCandidate // highest-scoring open-breaker candidate, kept as a forced-probe fallback
 	for _, sp := range all {
 		if !matchFormat(sp.APIFormat, apiFormat) {
 			if explain != nil {
@@ -381,6 +388,14 @@ func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestReq
 						Detail:     "circuit breaker open",
 					})
 				}
+				// This candidate passed format + capability and is excluded only by
+				// its open breaker. Remember the best such one so SelectWithExplanation
+				// can fall back to a single forced probe if nothing else can route.
+				cand := rankedCandidate{ScoredProvider: adjusted, matchRank: rank}
+				if bestOpen == nil || cand.matchRank < bestOpen.matchRank ||
+					(cand.matchRank == bestOpen.matchRank && cand.Score > bestOpen.Score) {
+					bestOpen = &cand
+				}
 				continue
 			case BreakerHalfOpen:
 				adjusted.Score *= 0.3
@@ -397,7 +412,7 @@ func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestReq
 		})
 	}
 	if len(candidates) == 0 {
-		return nil
+		return nil, bestOpen
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
@@ -406,7 +421,7 @@ func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestReq
 		}
 		return candidates[i].Score > candidates[j].Score
 	})
-	return candidates
+	return candidates, bestOpen
 }
 
 // filterReasonFromRequirements returns a human-readable explanation of why
@@ -556,9 +571,11 @@ func (rt *RoutingTable) DebugScores(model string) []ScoredProvider {
 }
 
 // SelectWithExplanation is like Select but also returns filtering reasons for tracing.
-func (rt *RoutingTable) SelectWithExplanation(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) ([]ScoredProvider, []CandidateEntry, []FilteredEntry) {
+// The final bool is forcedProbe: true when every real candidate was filtered and the
+// returned single candidate is a best-effort forced probe of an open-breaker provider.
+func (rt *RoutingTable) SelectWithExplanation(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) ([]ScoredProvider, []CandidateEntry, []FilteredEntry, bool) {
 	var explain selectionExplanation
-	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers, &explain)
+	candidates, bestOpen := rt.rankedCandidates(model, apiFormat, req, stats, breakers, &explain)
 
 	// Build candidate entries for trace
 	var candidateEntries []CandidateEntry
@@ -578,7 +595,25 @@ func (rt *RoutingTable) SelectWithExplanation(model, apiFormat string, req Reque
 	}
 
 	if len(candidates) == 0 {
-		return nil, candidateEntries, explain.Filtered
+		// Every real candidate was filtered. If the only blocker is open breakers,
+		// fall back to the best open provider as a single forced-probe candidate, so
+		// a fully-blacked-out model still gets a recovery attempt instead of a hard 404.
+		if bestOpen != nil {
+			state := BreakerOpen
+			if breakers != nil {
+				state = breakers.GetState(bestOpen.ProviderID, model)
+			}
+			entry := CandidateEntry{
+				ProviderID:   bestOpen.ProviderID,
+				ProviderName: bestOpen.ProviderName,
+				Score:        bestOpen.Score,
+				MatchRank:    bestOpen.matchRank,
+				BreakerState: state.String(),
+				Breakdown:    bestOpen.Breakdown,
+			}
+			return []ScoredProvider{bestOpen.ScoredProvider}, []CandidateEntry{entry}, explain.Filtered, true
+		}
+		return nil, candidateEntries, explain.Filtered, false
 	}
 
 	// Same selection logic as Select
@@ -608,7 +643,7 @@ func (rt *RoutingTable) SelectWithExplanation(model, apiFormat string, req Reque
 			result = append(result, candidate.ScoredProvider)
 		}
 	}
-	return result, candidateEntries, explain.Filtered
+	return result, candidateEntries, explain.Filtered, false
 }
 
 // RoutingExplanation is the full explanation for a routing decision.
@@ -623,7 +658,7 @@ type RoutingExplanation struct {
 
 // Explain returns a detailed explanation of the routing decision for a model+shape.
 func (rt *RoutingTable) Explain(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) *RoutingExplanation {
-	_, candidates, filtered := rt.SelectWithExplanation(model, apiFormat, req, stats, breakers)
+	_, candidates, filtered, _ := rt.SelectWithExplanation(model, apiFormat, req, stats, breakers)
 	return &RoutingExplanation{
 		Model:      model,
 		Endpoint:   apiFormat,

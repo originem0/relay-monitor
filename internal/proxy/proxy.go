@@ -193,14 +193,23 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 	}()
 
 	// Get routing candidates with explanation data for tracing
-	candidates, candidateEntries, filtered := p.table.SelectWithExplanation(req.Model, apiFormat, req.requirements(), p.stats, p.breakers)
+	candidates, candidateEntries, filtered, forcedProbe := p.table.SelectWithExplanation(req.Model, apiFormat, req.requirements(), p.stats, p.breakers)
 	trace.Candidates = candidateEntries
 	trace.Filtered = filtered
 
 	if len(candidates) == 0 {
 		trace.FinalStatus = "failed"
-		writeError(w, 404, "model_not_found",
-			fmt.Sprintf("Model '%s' is not available on any healthy provider", req.Model))
+		if len(filtered) == 0 {
+			// Model isn't in the routing table at all — a genuinely unknown model.
+			writeError(w, 404, "model_not_found",
+				fmt.Sprintf("Model '%s' is not available on any provider", req.Model))
+		} else {
+			// Model exists but every candidate was filtered out (capability/format
+			// mismatch). Surface that as a 503, not a misleading "model not found".
+			w.Header().Set("Retry-After", "30")
+			writeError(w, 503, "no_available_provider",
+				fmt.Sprintf("Model '%s' exists but no provider can currently serve this request shape (%d filtered)", req.Model, len(filtered)))
+		}
 		return
 	}
 
@@ -224,7 +233,19 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 		}
 
 		halfOpenProbe := false
-		if p.breakers != nil && p.breakers.GetState(candidate.ProviderID, req.Model) == BreakerHalfOpen {
+		if forcedProbe {
+			// Every provider is circuit-broken; `candidate` is the best one, surfaced
+			// as a single recovery probe. Limit to one in-flight probe — concurrent
+			// requests that lose the race fail fast rather than stampeding a dead site.
+			if !p.breakers.AcquireForceProbe(candidate.ProviderID, req.Model) {
+				trace.FinalStatus = "failed"
+				w.Header().Set("Retry-After", "5")
+				writeError(w, 503, "providers_circuit_broken",
+					fmt.Sprintf("All providers for '%s' are circuit-broken; a recovery probe is already in progress, retry shortly", req.Model))
+				return
+			}
+			halfOpenProbe = true // treat like a half-open probe: a failure re-opens the breaker
+		} else if p.breakers != nil && p.breakers.GetState(candidate.ProviderID, req.Model) == BreakerHalfOpen {
 			if !p.breakers.AcquireProbe(candidate.ProviderID, req.Model) {
 				log.Printf("[proxy] %s skipping %s: half-open probe already in progress", req.Model, candidate.ProviderName)
 				continue
@@ -294,7 +315,11 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 			default:
 				p.breakers.ReleaseProbe(candidate.ProviderID, req.Model)
 			}
-		} else if outcome.result == forwardRetry {
+		} else if outcome.result == forwardRetry || outcome.failure == FailureModelGone {
+			// forwardRetry (5xx/429/timeout) trips the breaker as before; a persistent
+			// "model gone" (404) now trips it too, so a station that no longer serves
+			// this model stops being retried on every single request (cooldown + the
+			// half-open probe will re-admit it if the model comes back).
 			p.breakers.RecordFailure(candidate.ProviderID, req.Model)
 		}
 
@@ -310,6 +335,13 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 
 	// All attempts exhausted
 	trace.FinalStatus = "failed"
+	if forcedProbe {
+		// The forced recovery probe itself failed without writing a response.
+		w.Header().Set("Retry-After", "5")
+		writeError(w, 503, "providers_circuit_broken",
+			fmt.Sprintf("All providers for '%s' are circuit-broken; recovery probe failed, retry shortly", req.Model))
+		return
+	}
 	writeError(w, 502, "all_providers_failed", "All providers failed for this request")
 }
 
@@ -374,8 +406,10 @@ type forwardOutcome struct {
 	failure    FailureClass // FailureNone on success
 }
 
-// fallbackUserAgent is used when the downstream client sends no User-Agent,
-// to avoid exposing Go-http-client/1.1 to upstream providers.
+// fallbackUserAgent is the browser UA the proxy always presents to upstreams
+// (see forwardOne). It deliberately matches checker.UserAgent so any site the
+// checker probed as healthy stays reachable through the proxy — many relays gate
+// on User-Agent and reject non-browser clients like openclaw-rescue / curl.
 const fallbackUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, apiKey string, body []byte, reqMeta proxyRequestMeta, apiFormat string, w http.ResponseWriter, origReq *http.Request) forwardOutcome {
@@ -395,12 +429,13 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 	// Copy relevant headers from original request
 	upstream.Header.Set("Content-Type", "application/json")
 	upstream.Header.Set("Authorization", "Bearer "+apiKey)
-	if ua := origReq.Header.Get("User-Agent"); ua != "" {
-		upstream.Header.Set("User-Agent", ua)
-	} else {
-		// Fallback: mimic a browser UA rather than exposing Go-http-client
-		upstream.Header.Set("User-Agent", fallbackUserAgent)
-	}
+	// Always present a browser UA to the upstream — the same one the checker uses
+	// to probe it. Forwarding the downstream client's own UA (openclaw-rescue,
+	// curl, …) gets rejected by relays that gate on User-Agent (Cloudflare 1010,
+	// or a bogus 401 "invalid API key"), even though the checker saw the site
+	// healthy and routed it. Keeping proxy UA == checker UA makes a routable model
+	// actually callable through the proxy.
+	upstream.Header.Set("User-Agent", fallbackUserAgent)
 	if accept := origReq.Header.Get("Accept"); accept != "" {
 		upstream.Header.Set("Accept", accept)
 	}

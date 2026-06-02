@@ -543,7 +543,7 @@ func TestSelectWithExplanation_BreakerFilteredShown(t *testing.T) {
 	breakers.ForceState(2, "m1", BreakerOpen)
 	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
-	candidates, candidateEntries, filtered := rt.SelectWithExplanation("m1", "chat", RequestRequirements{}, nil, breakers)
+	candidates, candidateEntries, filtered, _ := rt.SelectWithExplanation("m1", "chat", RequestRequirements{}, nil, breakers)
 	if len(candidates) != 1 {
 		t.Fatalf("expected 1 candidate, got %d", len(candidates))
 	}
@@ -584,12 +584,76 @@ func TestSelectWithExplanation_CapabilityFilteredShown(t *testing.T) {
 
 	rt.Rebuild(results, dbProviders, memProviders, nil, caps)
 
-	_, _, filtered := rt.SelectWithExplanation("m1", "chat", RequestRequirements{NeedsTools: true}, nil, nil)
+	_, _, filtered, _ := rt.SelectWithExplanation("m1", "chat", RequestRequirements{NeedsTools: true}, nil, nil)
 	if len(filtered) != 1 {
 		t.Fatalf("expected 1 filtered entry, got %d", len(filtered))
 	}
 	if filtered[0].ReasonCode != "capability_unsupported" {
 		t.Errorf("expected reason = capability_unsupported, got %s", filtered[0].ReasonCode)
+	}
+}
+
+func TestSelectWithExplanation_ForcedProbeWhenAllOpen(t *testing.T) {
+	rt := NewRoutingTable()
+	breakers := NewBreakers()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "fast", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 500},
+		{ProviderID: 2, ProviderName: "slow", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 8000},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "fast", BaseURL: "https://f.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+		{ID: 2, Name: "slow", BaseURL: "https://s.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "fast", APIKey: "k1"},
+		{Name: "slow", APIKey: "k2"},
+	}
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
+
+	// Every candidate's breaker is open → no normal candidate survives.
+	breakers.ForceState(1, "m1", BreakerOpen)
+	breakers.ForceState(2, "m1", BreakerOpen)
+
+	candidates, _, filtered, forcedProbe := rt.SelectWithExplanation("m1", "chat", RequestRequirements{}, nil, breakers)
+	if !forcedProbe {
+		t.Fatal("expected forcedProbe=true when every candidate is open")
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 forced-probe candidate, got %d", len(candidates))
+	}
+	if candidates[0].ProviderName != "fast" {
+		t.Errorf("forced-probe target = %s, want fast (highest score)", candidates[0].ProviderName)
+	}
+	if len(filtered) != 2 {
+		t.Errorf("expected both providers reported in filtered, got %d", len(filtered))
+	}
+}
+
+func TestRoutePausedExcludedFromRouting(t *testing.T) {
+	rt := NewRoutingTable()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "active", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000},
+		{ProviderID: 2, ProviderName: "paused", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000},
+		{ProviderID: 3, ProviderName: "disabled", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "active", BaseURL: "https://a.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+		{ID: 2, Name: "paused", BaseURL: "https://p.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+		{ID: 3, Name: "disabled", BaseURL: "https://d.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "active", APIKey: "k1"},
+		{Name: "paused", APIKey: "k2", RoutePaused: true},
+		{Name: "disabled", APIKey: "k3", Disabled: true},
+	}
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
+
+	candidates := rt.Select("m1", "chat", RequestRequirements{}, nil, nil)
+	if len(candidates) != 1 {
+		t.Fatalf("expected only 'active' routable, got %d", len(candidates))
+	}
+	if candidates[0].ProviderName != "active" {
+		t.Errorf("routable = %s, want active (paused + disabled both excluded)", candidates[0].ProviderName)
 	}
 }
 

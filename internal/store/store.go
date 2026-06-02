@@ -46,6 +46,21 @@ func New(dbPath string) (*Store, error) {
 	db.Exec(`UPDATE capabilities SET chat_tested_at = tested_at WHERE chat_tested_at IS NULL AND (streaming IS NOT NULL OR tool_use IS NOT NULL)`)
 	db.Exec(`UPDATE capabilities SET responses_tested_at = tested_at WHERE responses_tested_at IS NULL AND (responses_basic IS NOT NULL OR responses_streaming IS NOT NULL OR responses_tool_use IS NOT NULL)`)
 
+	// fingerprint_results gained columns over time. CREATE TABLE IF NOT EXISTS does
+	// not alter a pre-existing table, so add the nullable columns idempotently —
+	// duplicate-column errors are ignored, matching the capabilities migration above.
+	// Without this, an old DB missing these columns makes every InsertFingerprintResult
+	// fail with "no such column", silently dropping fingerprint results.
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN l1 INTEGER`)
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN l2 INTEGER`)
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN l3 INTEGER`)
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN l4 INTEGER`)
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN expected_tier TEXT`)
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN expected_min INTEGER`)
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN self_id_verdict TEXT`)
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN self_id_detail TEXT`)
+	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN answers_json TEXT`)
+
 	s := &Store{db: db}
 	if err := s.AbortRunningCheckRuns("aborted during restart"); err != nil {
 		db.Close()

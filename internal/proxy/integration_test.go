@@ -648,7 +648,7 @@ func TestSelectWithExplanationAllFilterReasons(t *testing.T) {
 
 	// Chat request with tools → should filter out: responses-only (format), broken (breaker), no-tools (capability)
 	req := RequestRequirements{NeedsTools: true}
-	candidates, candidateEntries, filtered := rt.SelectWithExplanation("m1", "chat", req, nil, breakers)
+	candidates, candidateEntries, filtered, _ := rt.SelectWithExplanation("m1", "chat", req, nil, breakers)
 
 	// Should have exactly 1 candidate: "good"
 	if len(candidates) != 1 {
@@ -697,5 +697,128 @@ func TestSelectWithExplanationAllFilterReasons(t *testing.T) {
 		if bd.BaseScore == 0 {
 			t.Error("candidate breakdown has zero base score")
 		}
+	}
+}
+
+// ===================================================================
+// 8. 全熔断 → 强制探测恢复 / 误导 404 修复
+// ===================================================================
+
+func TestForcedProbeRecoversWhenAllBreakersOpen(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		respondJSON(w)
+	}))
+	defer srv.Close()
+
+	cfg := newTestProxyCfg()
+	cfg.MaxRetries = 0
+	p := New(cfg, &http.Client{Timeout: 2 * time.Second}, nil)
+	t.Cleanup(func() { p.Traces().Stop() })
+	buildTable(p, []struct {
+		id   int64
+		name string
+		url  string
+	}{
+		{1, "only", srv.URL},
+	})
+
+	// The only provider for m1 is circuit-broken.
+	p.breakers.ForceState(1, "m1", BreakerOpen)
+
+	rec := httptest.NewRecorder()
+	p.proxyRequest(rec, proxyReq("m1"), "chat", "/chat/completions")
+
+	// Instead of a blanket failure, the proxy force-probes the best open provider.
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (forced probe should reach the open provider)", rec.Code)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hits = %d, want 1 (single forced probe)", hits.Load())
+	}
+	// A successful probe resets the breaker to healthy.
+	if s := p.breakers.GetState(1, "m1"); s != BreakerHealthy {
+		t.Errorf("breaker after successful probe = %s, want healthy", s)
+	}
+}
+
+func TestUnknownModelIs404ButFilteredIs503(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		respondJSON(w)
+	}))
+	defer srv.Close()
+
+	p := New(newTestProxyCfg(), &http.Client{Timeout: 2 * time.Second}, nil)
+	t.Cleanup(func() { p.Traces().Stop() })
+
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "notools", Model: "m1", Vendor: "openai", Status: "ok", Correct: true, LatencyMs: 100},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "notools", BaseURL: srv.URL, Status: "ok", Health: 100, APIFormat: "chat"},
+	}
+	memProviders := []provider.Provider{{Name: "notools", BaseURL: srv.URL, APIKey: "k1"}}
+	trueVal := true
+	falseVal := false
+	caps := map[int64]map[string]store.CapabilityRow{
+		1: {"m1": {Streaming: &trueVal, ToolUse: &falseVal}},
+	}
+	p.RebuildTable(results, dbProviders, memProviders, nil, caps)
+
+	// (a) Model not in the routing table at all → genuine 404 model_not_found.
+	rec := httptest.NewRecorder()
+	p.proxyRequest(rec, proxyReq("no-such-model"), "chat", "/chat/completions")
+	if rec.Code != 404 {
+		t.Fatalf("unknown model status = %d, want 404", rec.Code)
+	}
+	var resp map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if errObj, _ := resp["error"].(map[string]any); errObj == nil || errObj["type"] != "model_not_found" {
+		t.Errorf("unknown model error type = %v, want model_not_found", resp["error"])
+	}
+
+	// (b) Model exists but the only provider can't satisfy the request shape
+	// (tools required, provider has tool_use=false) → 503, not a misleading 404.
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m1","tools":[{"type":"function","function":{"name":"x"}}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	p.proxyRequest(rec, req, "chat", "/chat/completions")
+	if rec.Code != 503 {
+		t.Fatalf("filtered-model status = %d, want 503", rec.Code)
+	}
+}
+
+// 9. 持续 model_gone(404) 触发熔断退场
+func TestModelGone404TripsBreaker(t *testing.T) {
+	var hits atomic.Int32
+	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, `{"error":{"message":"model not found"}}`, http.StatusNotFound)
+	}))
+	defer gone.Close()
+
+	cfg := newTestProxyCfg()
+	cfg.MaxRetries = 2
+	p := New(cfg, &http.Client{Timeout: 2 * time.Second}, nil)
+	t.Cleanup(func() { p.Traces().Stop() })
+	buildTable(p, []struct {
+		id   int64
+		name string
+		url  string
+	}{
+		{1, "gone", gone.URL},
+	})
+
+	// Three requests, each gets 404 model_gone. Previously 404 was "mild" and never
+	// tripped the breaker, so a dead model was retried forever. Now it accumulates.
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		p.proxyRequest(rec, proxyReq("m1"), "chat", "/chat/completions")
+	}
+
+	if s := p.breakers.GetState(1, "m1"); s != BreakerOpen {
+		t.Errorf("breaker after 3x model_gone(404) = %s, want open", s)
 	}
 }

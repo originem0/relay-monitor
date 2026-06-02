@@ -115,6 +115,26 @@ func (b *Breakers) ReleaseProbe(providerID int64, model string) {
 	}
 }
 
+// AcquireForceProbe grants a single probe while the breaker is OPEN. It lets a
+// fully-blacked-out model get one recovery attempt without waiting out the 60s
+// cooldown; the probeInProgress flag still guarantees only one request probes at
+// a time (concurrent callers see false and fail fast, so the dead provider is not
+// stampeded). The slot is released by RecordSuccess, or by the OPEN→HALF_OPEN
+// transition in GetState once the cooldown elapses. A failed probe keeps the slot
+// held (RecordFailure does not touch it in the OPEN branch), so the provider is
+// not re-probed until its cooldown turns it half-open.
+func (b *Breakers) AcquireForceProbe(providerID int64, model string) bool {
+	e := b.getOrCreate(providerID, model)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.state == BreakerOpen && !e.probeInProgress {
+		e.probeInProgress = true
+		return true
+	}
+	return false
+}
+
 // RecordSuccess marks a successful request. Resets the breaker to HEALTHY.
 func (b *Breakers) RecordSuccess(providerID int64, model string) {
 	e := b.getOrCreate(providerID, model)

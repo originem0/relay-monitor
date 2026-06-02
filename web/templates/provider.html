@@ -5,6 +5,7 @@
 <div class="provider-header">
     <h1>{{.Provider.Name}}</h1>
     {{if .Provider.Disabled}}<span class="status-badge status-unknown" style="background:var(--error);color:#fff">已禁用</span>{{end}}
+    {{if .Provider.RoutePaused}}<span class="status-badge status-unknown" style="background:#c2410c;color:#fff" title="不参与代理路由，但仍在巡检监控">已停用路由</span>{{end}}
     <span class="status-badge status-{{.Provider.Status}}">{{.Provider.Status}}</span>
     <div class="health-badge {{if ge .Provider.Health 80}}health-good{{else if ge .Provider.Health 50}}health-warn{{else}}health-bad{{end}}">
         {{.Provider.Health}}
@@ -24,10 +25,16 @@
             hx-swap="none">
         {{if .Provider.Pinned}}取消置顶{{else}}置顶{{end}}
     </button>
+    <button class="btn btn-sm {{if .Provider.RoutePaused}}btn-primary{{else}}btn-danger{{end}}"
+            hx-post="/api/v1/providers/{{.Provider.Name}}/pause"
+            hx-swap="none"
+            {{if not .Provider.RoutePaused}}hx-confirm="停用路由后代理不再把流量发给该站点，但巡检仍会继续监控其恢复。确认？"{{end}}>
+        {{if .Provider.RoutePaused}}恢复路由{{else}}停用路由{{end}}
+    </button>
     <button class="btn btn-sm {{if .Provider.Disabled}}btn-primary{{else}}btn-danger{{end}}"
             hx-post="/api/v1/providers/{{.Provider.Name}}/disable"
             hx-swap="none"
-            {{if not .Provider.Disabled}}hx-confirm="禁用后该站点不再参与检测和路由，确认？"{{end}}>
+            {{if not .Provider.Disabled}}hx-confirm="禁用检测会同时停止巡检和代理路由（完全停用）。确认？"{{end}}>
         {{if .Provider.Disabled}}启用检测{{else}}禁用检测{{end}}
     </button>
     <button class="btn btn-sm btn-danger"
