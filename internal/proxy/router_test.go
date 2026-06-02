@@ -67,7 +67,7 @@ func TestRebuildFiltersIncorrect(t *testing.T) {
 	}
 }
 
-func TestRebuildFiltersDownProvider(t *testing.T) {
+func TestRebuildDownProviderIncludedButPenalized(t *testing.T) {
 	rt := NewRoutingTable()
 	results := []store.CheckResultRow{
 		{ProviderID: 1, ProviderName: "up", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000},
@@ -84,9 +84,23 @@ func TestRebuildFiltersDownProvider(t *testing.T) {
 
 	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
 
+	// Down provider's correct model should still be routable (not hard-filtered)
 	candidates := rt.Select("m1", "chat", RequestRequirements{}, nil, nil)
-	if len(candidates) != 1 {
-		t.Fatalf("got %d candidates, want 1 (down provider filtered)", len(candidates))
+	if len(candidates) != 2 {
+		t.Fatalf("got %d candidates, want 2 (down provider penalized but included)", len(candidates))
+	}
+
+	// "up" should have a higher raw score (checked via DebugScores, which doesn't do weighted random)
+	scores := rt.DebugScores("m1")
+	if len(scores) != 2 {
+		t.Fatalf("debug scores: got %d, want 2", len(scores))
+	}
+	// DebugScores returns sorted by score desc
+	if scores[0].ProviderName != "up" {
+		t.Errorf("highest scoring provider = %s (%.3f), want up", scores[0].ProviderName, scores[0].Score)
+	}
+	if scores[0].Score <= scores[1].Score {
+		t.Errorf("up score (%.3f) should be > down score (%.3f)", scores[0].Score, scores[1].Score)
 	}
 }
 
@@ -323,6 +337,23 @@ func TestApplyRequestRequirementsAllowsBasicResponsesWithoutTools(t *testing.T) 
 	}
 }
 
+func TestApplyRequestRequirementsDoesNotPenalizeProvenChatResponsesSupport(t *testing.T) {
+	basic := true
+	sp := ScoredProvider{
+		APIFormat:      "chat",
+		Score:          1,
+		ResponsesBasic: &basic,
+	}
+
+	_, rank, ok := applyRequestRequirements(sp, "responses", RequestRequirements{})
+	if !ok {
+		t.Fatal("provider with proven /responses support should remain eligible")
+	}
+	if rank != 0 {
+		t.Fatalf("rank = %d, want 0 for a provider with proven /responses support", rank)
+	}
+}
+
 func TestApplyRequestRequirementsRejectsKnownBadResponsesSupport(t *testing.T) {
 	basic := false
 	sp := ScoredProvider{
@@ -491,4 +522,112 @@ func TestDebugSelectionUsesRequestAwareOrdering(t *testing.T) {
 	if debug[1].MatchRank <= debug[0].MatchRank {
 		t.Fatalf("unknown fallback should rank worse: %+v", debug)
 	}
+}
+
+func TestSelectWithExplanation_BreakerFilteredShown(t *testing.T) {
+	rt := NewRoutingTable()
+	breakers := NewBreakers()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "healthy", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000},
+		{ProviderID: 2, ProviderName: "broken", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "healthy", BaseURL: "https://h.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+		{ID: 2, Name: "broken", BaseURL: "https://b.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "healthy", APIKey: "k1"},
+		{Name: "broken", APIKey: "k2"},
+	}
+
+	breakers.ForceState(2, "m1", BreakerOpen)
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
+
+	candidates, candidateEntries, filtered := rt.SelectWithExplanation("m1", "chat", RequestRequirements{}, nil, breakers)
+	if len(candidates) != 1 {
+		t.Fatalf("expected 1 candidate, got %d", len(candidates))
+	}
+	if len(candidateEntries) != 1 {
+		t.Fatalf("expected 1 candidate entry, got %d", len(candidateEntries))
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 filtered entry, got %d", len(filtered))
+	}
+	if filtered[0].ProviderName != "broken" {
+		t.Errorf("expected filtered provider = broken, got %s", filtered[0].ProviderName)
+	}
+	if filtered[0].ReasonCode != "breaker_open" {
+		t.Errorf("expected reason = breaker_open, got %s", filtered[0].ReasonCode)
+	}
+}
+
+func TestSelectWithExplanation_CapabilityFilteredShown(t *testing.T) {
+	rt := NewRoutingTable()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "has-tools", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000},
+		{ProviderID: 2, ProviderName: "no-tools", Model: "m1", Vendor: "v", Status: "ok", Correct: true, LatencyMs: 1000},
+	}
+	dbProviders := []store.ProviderRow{
+		{ID: 1, Name: "has-tools", BaseURL: "https://h.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+		{ID: 2, Name: "no-tools", BaseURL: "https://n.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"},
+	}
+	memProviders := []provider.Provider{
+		{Name: "has-tools", APIKey: "k1"},
+		{Name: "no-tools", APIKey: "k2"},
+	}
+	trueVal := true
+	falseVal := false
+	caps := map[int64]map[string]store.CapabilityRow{
+		1: {"m1": {Streaming: &trueVal, ToolUse: &trueVal}},
+		2: {"m1": {Streaming: &trueVal, ToolUse: &falseVal}},
+	}
+
+	rt.Rebuild(results, dbProviders, memProviders, nil, caps)
+
+	_, _, filtered := rt.SelectWithExplanation("m1", "chat", RequestRequirements{NeedsTools: true}, nil, nil)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 filtered entry, got %d", len(filtered))
+	}
+	if filtered[0].ReasonCode != "capability_unsupported" {
+		t.Errorf("expected reason = capability_unsupported, got %s", filtered[0].ReasonCode)
+	}
+}
+
+func TestScoreBreakdownPopulated(t *testing.T) {
+	rt := NewRoutingTable()
+	results, dbProviders, memProviders := makeTestData()
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
+
+	rt.mu.RLock()
+	providers := rt.models["gpt-5"]
+	rt.mu.RUnlock()
+
+	if len(providers) == 0 {
+		t.Fatal("no providers in routing table")
+	}
+
+	sp := providers[0]
+	bd := sp.Breakdown
+	if bd.LatencyScore == 0 && bd.HealthScore == 0 {
+		t.Error("breakdown should have non-zero values")
+	}
+	if bd.BaseScore == 0 {
+		t.Error("base score should be non-zero")
+	}
+	if bd.PriorityMul == 0 {
+		t.Error("priority multiplier should be non-zero (default 1.0)")
+	}
+
+	// Verify base score is correctly computed: 0.4*latency + 0.3*health + 0.3*fp
+	expected := 0.4*bd.LatencyScore + 0.3*bd.HealthScore + 0.3*bd.FingerprintScore
+	if abs(bd.BaseScore-expected) > 0.001 {
+		t.Errorf("base score %.3f doesn't match formula (expected %.3f)", bd.BaseScore, expected)
+	}
+}
+
+func abs(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
 }

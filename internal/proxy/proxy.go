@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,21 +28,30 @@ type Proxy struct {
 	table    *RoutingTable
 	breakers *Breakers
 	stats    *Stats
+	traces   *TraceCollector
 	warming  atomic.Bool // true while initial check is running
 }
 
+const (
+	defaultMaxRequestBodyBytes   int64 = 8 * 1024 * 1024
+	defaultMaxResponsesBodyBytes int64 = 2 * 1024 * 1024
+)
+
 // New creates a Proxy with the given config. The routing table starts empty.
-func New(cfg *config.ProxyConfig, client *http.Client) *Proxy {
+// traceStore may be nil to disable trace persistence.
+func New(cfg *config.ProxyConfig, client *http.Client, traceStore *store.Store) *Proxy {
 	p := &Proxy{
 		client:   client,
 		table:    NewRoutingTable(),
 		breakers: NewBreakers(),
 		stats:    NewStats(),
+		traces:   NewTraceCollector(traceStore, defaultRecentSize, defaultMaxKeep),
 	}
-	p.cfg.Store(cfg)
+	p.cfg.Store(normalizeProxyConfig(cfg))
 	if !p.table.Ready() {
 		p.warming.Store(true)
 	}
+	p.traces.Start()
 	return p
 }
 
@@ -49,8 +59,9 @@ func (p *Proxy) Config() *config.ProxyConfig          { return p.cfg.Load() }
 func (p *Proxy) Table() *RoutingTable                 { return p.table }
 func (p *Proxy) Breakers() *Breakers                  { return p.breakers }
 func (p *Proxy) Stats() *Stats                        { return p.stats }
+func (p *Proxy) Traces() *TraceCollector              { return p.traces }
 func (p *Proxy) SetWarming(v bool)                    { p.warming.Store(v) }
-func (p *Proxy) UpdateConfig(cfg *config.ProxyConfig) { p.cfg.Store(cfg) }
+func (p *Proxy) UpdateConfig(cfg *config.ProxyConfig) { p.cfg.Store(normalizeProxyConfig(cfg)) }
 
 // RebuildTable rebuilds the routing table from fresh check data.
 func (p *Proxy) RebuildTable(results []store.CheckResultRow, dbProviders []store.ProviderRow, memProviders []provider.Provider, fingerprints map[[2]string]FingerprintScore, capabilities map[int64]map[string]store.CapabilityRow) {
@@ -144,9 +155,13 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 
 	cfg := p.cfg.Load()
 
-	// Read and buffer the request body
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024)) // 10MB limit
+	// Read and buffer the request body once so retries can replay it verbatim.
+	body, err := readRequestBody(r, cfg.MaxRequestBodyBytes)
 	if err != nil {
+		if tooLarge, ok := err.(requestTooLargeError); ok {
+			writeRequestTooLarge(w, tooLarge.limit, "request body", "max_request_body_bytes")
+			return
+		}
 		writeError(w, 400, "invalid_request", "Failed to read request body")
 		return
 	}
@@ -157,10 +172,33 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 		writeError(w, 400, "invalid_request", "Request must include a 'model' field")
 		return
 	}
+	if apiFormat == "responses" && cfg.MaxResponsesBodyBytes > 0 && int64(len(body)) > cfg.MaxResponsesBodyBytes {
+		writeRequestTooLarge(w, cfg.MaxResponsesBodyBytes, "/v1/responses request body", "max_responses_body_bytes")
+		return
+	}
 
-	// Get routing candidates
-	candidates := p.table.Select(req.Model, apiFormat, req.requirements(), p.stats, p.breakers)
+	tools := hasTools(req.Tools)
+	trace := Trace{
+		ID:           newTraceID(),
+		ReceivedAt:   time.Now(),
+		Model:        req.Model,
+		Endpoint:     apiFormat,
+		Stream:       req.Stream,
+		HasTools:     tools,
+		ToolRequired: tools && requiresToolCall(req.ToolChoice),
+	}
+	defer func() {
+		trace.LatencyMs = time.Since(trace.ReceivedAt).Milliseconds()
+		p.traces.Emit(trace)
+	}()
+
+	// Get routing candidates with explanation data for tracing
+	candidates, candidateEntries, filtered := p.table.SelectWithExplanation(req.Model, apiFormat, req.requirements(), p.stats, p.breakers)
+	trace.Candidates = candidateEntries
+	trace.Filtered = filtered
+
 	if len(candidates) == 0 {
+		trace.FinalStatus = "failed"
 		writeError(w, 404, "model_not_found",
 			fmt.Sprintf("Model '%s' is not available on any healthy provider", req.Model))
 		return
@@ -172,6 +210,14 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 	}
 
 	attempt := 0
+	// Map provider → capability match rank so each attempt records why it ranked
+	// where it did (rank is computed per-request in SelectWithExplanation and is
+	// not carried on the flat candidate list).
+	rankByProvider := make(map[int64]int, len(candidateEntries))
+	for _, ce := range candidateEntries {
+		rankByProvider[ce.ProviderID] = ce.MatchRank
+	}
+
 	for _, candidate := range candidates {
 		if attempt >= maxAttempts {
 			break
@@ -207,14 +253,31 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 		}
 
 		upstreamURL := strings.TrimRight(candidate.BaseURL, "/") + pathSuffix
-		result, done := p.forwardOne(r.Context(), retryCfg, upstreamURL, candidate.APIKey, body, req, apiFormat, w, r)
+		outcome := p.forwardOne(r.Context(), retryCfg, upstreamURL, candidate.APIKey, body, req, apiFormat, w, r)
 		elapsed := time.Since(start).Milliseconds()
 
-		if result == forwardOK {
+		attemptEntry := Attempt{
+			Index:        tryIndex,
+			ProviderID:   candidate.ProviderID,
+			ProviderName: candidate.ProviderName,
+			Score:        candidate.Score,
+			MatchRank:    rankByProvider[candidate.ProviderID],
+			BreakerState: p.breakers.GetState(candidate.ProviderID, req.Model).String(),
+			HTTPStatus:   outcome.httpStatus,
+			Failure:      outcome.failure,
+			LatencyMs:    elapsed,
+			WroteBody:    outcome.wrote,
+		}
+
+		if outcome.result == forwardOK {
 			p.breakers.RecordSuccess(candidate.ProviderID, req.Model)
 			p.stats.Record(candidate.ProviderID, req.Model, elapsed, false)
+			trace.Attempts = append(trace.Attempts, attemptEntry)
+			trace.FinalStatus = "ok"
 			return
 		}
+
+		trace.Attempts = append(trace.Attempts, attemptEntry)
 
 		// Record stats error for all failure types
 		p.stats.Record(candidate.ProviderID, req.Model, elapsed, true)
@@ -222,21 +285,22 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 		// Only trigger circuit breaker for transient failures (5xx, 429, timeout)
 		if halfOpenProbe {
 			switch {
-			case result == forwardRetry:
+			case outcome.result == forwardRetry:
 				p.breakers.RecordFailure(candidate.ProviderID, req.Model)
-			case result == forwardRetryMild && !done:
+			case outcome.result == forwardRetryMild && !outcome.wrote:
 				p.breakers.RecordFailure(candidate.ProviderID, req.Model)
-			case result == forwardDone:
+			case outcome.result == forwardDone:
 				p.breakers.RecordFailure(candidate.ProviderID, req.Model)
 			default:
 				p.breakers.ReleaseProbe(candidate.ProviderID, req.Model)
 			}
-		} else if result == forwardRetry {
+		} else if outcome.result == forwardRetry {
 			p.breakers.RecordFailure(candidate.ProviderID, req.Model)
 		}
 
-		if done {
+		if outcome.wrote {
 			// Response already started (streaming), can't retry
+			trace.FinalStatus = "partial"
 			return
 		}
 
@@ -245,6 +309,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 	}
 
 	// All attempts exhausted
+	trace.FinalStatus = "failed"
 	writeError(w, 502, "all_providers_failed", "All providers failed for this request")
 }
 
@@ -299,11 +364,21 @@ const (
 	forwardDone                    // failed, but response already started (streaming)
 )
 
+// forwardOutcome is the full result of one upstream attempt. It carries the
+// HTTP status and failure class so the caller can populate a trace Attempt
+// without re-deriving them — the status is known here and nowhere else.
+type forwardOutcome struct {
+	result     forwardResult
+	wrote      bool         // true once bytes were written to the client (can't retry)
+	httpStatus int          // upstream HTTP status; 0 if no response was received
+	failure    FailureClass // FailureNone on success
+}
+
 // fallbackUserAgent is used when the downstream client sends no User-Agent,
 // to avoid exposing Go-http-client/1.1 to upstream providers.
 const fallbackUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, apiKey string, body []byte, reqMeta proxyRequestMeta, apiFormat string, w http.ResponseWriter, origReq *http.Request) (forwardResult, bool) {
+func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, apiKey string, body []byte, reqMeta proxyRequestMeta, apiFormat string, w http.ResponseWriter, origReq *http.Request) forwardOutcome {
 	timeout := cfg.RequestTimeout.Duration
 	if reqMeta.Stream {
 		timeout = cfg.StreamFirstByteTimeout.Duration
@@ -314,7 +389,7 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 
 	upstream, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return forwardRetry, false
+		return forwardOutcome{result: forwardRetry, failure: FailureUpstream5xx}
 	}
 
 	// Copy relevant headers from original request
@@ -332,32 +407,37 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 
 	resp, err := p.client.Do(upstream)
 	if err != nil {
+		// Surface a timeout distinctly from other transport failures so the
+		// trace shows the real reason instead of a generic upstream error.
+		fc := FailureUpstream5xx
+		if errors.Is(err, context.DeadlineExceeded) {
+			fc = FailureTimeout
+		}
 		log.Printf("[proxy] upstream connect error: %s: %v", url, err)
-		return forwardRetry, false
+		return forwardOutcome{result: forwardRetry, failure: fc}
 	}
 
-	// 5xx, 429 (rate limit): transient failure, retry on next provider
-	if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+	// 5xx / 429 / 401 / 403 / 404 / 413: discard the body and retry the next
+	// provider. classifyUpstreamFailure decides retry severity (forwardRetry
+	// trips the breaker, forwardRetryMild does not) and the precise failure class.
+	switch {
+	case resp.StatusCode >= 500, resp.StatusCode == 429,
+		resp.StatusCode == 401, resp.StatusCode == 403,
+		resp.StatusCode == 404, resp.StatusCode == 413:
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		log.Printf("[proxy] upstream %d from %s", resp.StatusCode, url)
-		return forwardRetry, false
-	}
-
-	// 401 (auth failed), 403 (quota exhausted), 404 (model gone):
-	// upstream-side issues, retry on next provider without triggering breaker
-	if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		result, fc := classifyUpstreamFailure(resp.StatusCode)
 		log.Printf("[proxy] upstream %d from %s, will retry next provider", resp.StatusCode, url)
-		return forwardRetryMild, false
+		return forwardOutcome{result: result, httpStatus: resp.StatusCode, failure: fc}
 	}
 
-	// Other 4xx: client error (bad request body etc), don't retry, forward as-is
+	// Other 4xx: a genuine client error (bad request body etc). Forward verbatim
+	// and do not retry — a different provider will not help.
 	if resp.StatusCode >= 400 {
 		copyResponse(w, resp)
 		resp.Body.Close()
-		return forwardRetryMild, true // done=true because we wrote the response
+		_, fc := classifyUpstreamFailure(resp.StatusCode)
+		return forwardOutcome{result: forwardRetryMild, wrote: true, httpStatus: resp.StatusCode, failure: fc}
 	}
 
 	if !reqMeta.Stream || resp.StatusCode != 200 {
@@ -366,35 +446,37 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 			resp.Body.Close()
 			if err != nil {
 				log.Printf("[proxy] failed reading upstream responses body from %s: %v", url, err)
-				return forwardRetry, false
+				return forwardOutcome{result: forwardRetry, httpStatus: 200, failure: FailureUpstream5xx}
 			}
 			if err := validateResponsesPayload(respBody, requiresToolCall(reqMeta.ToolChoice)); err != nil {
 				log.Printf("[proxy] malformed /responses payload from %s: %v", url, err)
-				return forwardRetry, false
+				return forwardOutcome{result: forwardRetry, httpStatus: 200, failure: FailureProtocolError}
 			}
 			writeResponseBytes(w, resp, respBody)
-			return forwardOK, true
+			return forwardOutcome{result: forwardOK, wrote: true, httpStatus: 200}
 		}
 
 		copyResponse(w, resp)
 		resp.Body.Close()
-		return forwardOK, true
+		return forwardOutcome{result: forwardOK, wrote: true, httpStatus: resp.StatusCode}
 	}
 
-	// Streaming: pipe SSE chunks (takes ownership of resp.Body)
+	// Streaming (status 200): pipe SSE chunks (takes ownership of resp.Body)
 	if apiFormat == "responses" {
-		return p.pipeResponsesStream(w, resp, cfg, requiresToolCall(reqMeta.ToolChoice))
+		result, wrote, fc := p.pipeResponsesStream(w, resp, cfg, requiresToolCall(reqMeta.ToolChoice))
+		return forwardOutcome{result: result, wrote: wrote, httpStatus: 200, failure: fc}
 	}
-	return p.pipeStream(w, resp, cfg), true
+	result, fc := p.pipeStream(w, resp, cfg)
+	return forwardOutcome{result: result, wrote: true, httpStatus: 200, failure: fc}
 }
 
-func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, cfg *config.ProxyConfig, requireToolCall bool) (forwardResult, bool) {
+func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, cfg *config.ProxyConfig, requireToolCall bool) (forwardResult, bool, FailureClass) {
 	defer resp.Body.Close()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		copyResponse(w, resp)
-		return forwardOK, true
+		return forwardOK, true, FailureNone
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -404,10 +486,12 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 	defer idle.Stop()
 
 	var timedOut atomic.Bool
-	done := make(chan struct {
-		result forwardResult
-		wrote  bool
-	}, 1)
+	type pipeResult struct {
+		result  forwardResult
+		wrote   bool
+		failure FailureClass
+	}
+	done := make(chan pipeResult, 1)
 
 	go func() {
 		started := false
@@ -435,9 +519,10 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 			flusher.Flush()
 		}
 
-		flushBlock := func() (forwardResult, bool, bool) {
+		// flushBlock returns (result, wrote, stop, failure).
+		flushBlock := func() (forwardResult, bool, bool, FailureClass) {
 			if len(blockLines) == 0 {
-				return forwardOK, started, false
+				return forwardOK, started, false, FailureNone
 			}
 
 			hasDone := false
@@ -449,10 +534,10 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 				facts, err := responsefmt.ValidateStreamEvent([]byte(payload))
 				if err != nil {
 					if !started {
-						return forwardRetry, false, true
+						return forwardRetry, false, true, FailureProtocolError
 					}
 					emitProtocolError("malformed upstream responses stream")
-					return forwardDone, true, true
+					return forwardDone, true, true, FailureProtocolError
 				}
 				if facts.HasFunctionCall {
 					sawFunctionCall = true
@@ -461,40 +546,37 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 
 			if hasDone && requireToolCall && !sawFunctionCall {
 				if !started {
-					return forwardRetry, false, true
+					return forwardRetry, false, true, FailureToolMissing
 				}
 				emitProtocolError("required tool call missing from streamed response")
-				return forwardDone, true, true
+				return forwardDone, true, true, FailureToolMissing
 			}
 
 			writeHeaders()
 			for _, line := range blockLines {
 				if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
-					return forwardDone, true, true
+					return forwardDone, true, true, FailureStreamBroken
 				}
 			}
 			if _, err := fmt.Fprint(w, "\n"); err != nil {
-				return forwardDone, true, true
+				return forwardDone, true, true, FailureStreamBroken
 			}
 			flusher.Flush()
 			if hasDone {
-				return forwardOK, true, true
+				return forwardOK, true, true, FailureNone
 			}
-			return forwardOK, true, false
+			return forwardOK, true, false, FailureNone
 		}
 
 		for scanner.Scan() {
 			line := scanner.Text()
 			idle.Reset(cfg.StreamIdleTimeout.Duration)
 			if line == "" {
-				result, wrote, stop := flushBlock()
+				result, wrote, stop, fc := flushBlock()
 				blockLines = nil
 				dataLines = nil
 				if stop {
-					done <- struct {
-						result forwardResult
-						wrote  bool
-					}{result: result, wrote: wrote}
+					done <- pipeResult{result: result, wrote: wrote, failure: fc}
 					return
 				}
 				continue
@@ -507,69 +589,51 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 		}
 
 		if len(blockLines) > 0 {
-			result, wrote, stop := flushBlock()
+			result, wrote, stop, fc := flushBlock()
 			if stop {
-				done <- struct {
-					result forwardResult
-					wrote  bool
-				}{result: result, wrote: wrote}
+				done <- pipeResult{result: result, wrote: wrote, failure: fc}
 				return
 			}
 		}
 
 		if timedOut.Load() {
 			if !started {
-				done <- struct {
-					result forwardResult
-					wrote  bool
-				}{result: forwardRetry, wrote: false}
+				done <- pipeResult{result: forwardRetry, wrote: false, failure: FailureStreamIdle}
 				return
 			}
 			emitProtocolError("upstream timeout")
-			done <- struct {
-				result forwardResult
-				wrote  bool
-			}{result: forwardDone, wrote: true}
+			done <- pipeResult{result: forwardDone, wrote: true, failure: FailureStreamIdle}
 			return
 		}
 		if scanner.Err() != nil {
 			if !started {
-				done <- struct {
-					result forwardResult
-					wrote  bool
-				}{result: forwardRetry, wrote: false}
+				done <- pipeResult{result: forwardRetry, wrote: false, failure: FailureStreamBroken}
 				return
 			}
-			done <- struct {
-				result forwardResult
-				wrote  bool
-			}{result: forwardDone, wrote: true}
+			done <- pipeResult{result: forwardDone, wrote: true, failure: FailureStreamBroken}
 			return
 		}
-		done <- struct {
-			result forwardResult
-			wrote  bool
-		}{result: forwardOK, wrote: started}
+		done <- pipeResult{result: forwardOK, wrote: started, failure: FailureNone}
 	}()
 
 	select {
 	case result := <-done:
-		return result.result, result.wrote
+		return result.result, result.wrote, result.failure
 	case <-idle.C:
 		timedOut.Store(true)
 		resp.Body.Close()
 		result := <-done
-		return result.result, result.wrote
+		return result.result, result.wrote, result.failure
 	}
 }
 
-func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *config.ProxyConfig) forwardResult {
+func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *config.ProxyConfig) (forwardResult, FailureClass) {
 	defer resp.Body.Close()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		copyResponse(w, resp)
-		return forwardOK
+		return forwardOK, FailureNone
 	}
 
 	// Copy response headers
@@ -620,12 +684,16 @@ func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *conf
 
 	select {
 	case result := <-done:
-		return result
+		fc := FailureNone
+		if result != forwardOK {
+			fc = FailureStreamBroken
+		}
+		return result, fc
 	case <-idle.C:
 		// Upstream went silent mid-stream; signal timeout and close body to unblock scanner
 		timedOut.Store(true)
 		resp.Body.Close()
-		return <-done
+		return <-done, FailureStreamIdle
 	}
 }
 
@@ -651,6 +719,74 @@ func writeResponseBytes(w http.ResponseWriter, resp *http.Response, body []byte)
 
 func validateResponsesPayload(body []byte, requireToolCall bool) error {
 	return responsefmt.ValidatePayload(body, requireToolCall)
+}
+
+type requestTooLargeError struct {
+	limit int64
+}
+
+func (e requestTooLargeError) Error() string {
+	return fmt.Sprintf("request body exceeds limit %d bytes", e.limit)
+}
+
+func normalizeProxyConfig(cfg *config.ProxyConfig) *config.ProxyConfig {
+	if cfg == nil {
+		cfg = &config.ProxyConfig{}
+	}
+	clone := *cfg
+	if clone.MaxRequestBodyBytes <= 0 {
+		clone.MaxRequestBodyBytes = defaultMaxRequestBodyBytes
+	}
+	if clone.MaxResponsesBodyBytes <= 0 {
+		clone.MaxResponsesBodyBytes = defaultMaxResponsesBodyBytes
+	}
+	return &clone
+}
+
+func readRequestBody(r *http.Request, limit int64) ([]byte, error) {
+	if limit > 0 && r.ContentLength > limit {
+		return nil, requestTooLargeError{limit: limit}
+	}
+	if limit <= 0 {
+		return io.ReadAll(r.Body)
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, requestTooLargeError{limit: limit}
+	}
+	return body, nil
+}
+
+func writeRequestTooLarge(w http.ResponseWriter, limit int64, scope, configKey string) {
+	writeError(
+		w,
+		http.StatusRequestEntityTooLarge,
+		"request_too_large",
+		fmt.Sprintf(
+			"%s exceeds relay budget (%s via proxy.%s). Start a fresh session, compact the conversation, or raise the limit.",
+			scope,
+			formatBytes(limit),
+			configKey,
+		),
+	)
+}
+
+func formatBytes(n int64) string {
+	const (
+		kib = int64(1024)
+		mib = 1024 * kib
+	)
+	switch {
+	case n >= mib:
+		return fmt.Sprintf("%.1f MiB", float64(n)/float64(mib))
+	case n >= kib:
+		return fmt.Sprintf("%.1f KiB", float64(n)/float64(kib))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 func writeError(w http.ResponseWriter, code int, errType, message string) {

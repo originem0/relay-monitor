@@ -35,6 +35,8 @@ type ProxyConfig struct {
 	StreamFirstByteTimeout Duration `toml:"stream_first_byte_timeout"`
 	StreamIdleTimeout      Duration `toml:"stream_idle_timeout"`
 	MaxRetries             int      `toml:"max_retries"`
+	MaxRequestBodyBytes    int64    `toml:"max_request_body_bytes"`
+	MaxResponsesBodyBytes  int64    `toml:"max_responses_body_bytes"`
 }
 
 // AppConfig holds all application settings.
@@ -69,6 +71,8 @@ func DefaultConfig() *AppConfig {
 			StreamFirstByteTimeout: Duration{30 * time.Second},
 			StreamIdleTimeout:      Duration{60 * time.Second},
 			MaxRetries:             2,
+			MaxRequestBodyBytes:    8 * 1024 * 1024,
+			MaxResponsesBodyBytes:  2 * 1024 * 1024,
 		},
 	}
 }

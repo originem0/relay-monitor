@@ -111,12 +111,17 @@ func TestAuthoritativeProviderStateRejectsPartialFullRun(t *testing.T) {
 	}
 }
 
-func TestAuthoritativeProviderStateTreatsProviderLevelFailureAsAuthoritative(t *testing.T) {
+func TestAuthoritativeProviderStateTreatsProviderLevelFailureAsNonDestructive(t *testing.T) {
 	replaceCurrent, updateProvider := authoritativeProviderState(checker.ModeFull, &checker.ProviderResult{
 		Provider: "relay",
 		Error:    "fetch models failed",
 	})
-	if !replaceCurrent || !updateProvider {
-		t.Fatalf("provider-level full failure should clear current snapshot and update provider state: replace=%v update=%v", replaceCurrent, updateProvider)
+	// Provider-level failures (DNS, connection, auth) should update the provider's status
+	// but NOT clear current_results — transient failures shouldn't evict verified models.
+	if replaceCurrent {
+		t.Fatalf("provider-level failure should NOT clear current snapshot: replace=%v", replaceCurrent)
+	}
+	if !updateProvider {
+		t.Fatalf("provider-level failure should update provider status: update=%v", updateProvider)
 	}
 }

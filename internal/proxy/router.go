@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"sync"
@@ -24,6 +25,7 @@ type ScoredProvider struct {
 	ResponsesBasic     *bool
 	ResponsesStreaming *bool
 	ResponsesToolUse   *bool
+	Breakdown          ScoreBreakdown // populated during Rebuild
 }
 
 type RequestRequirements struct {
@@ -99,12 +101,8 @@ func (rt *RoutingTable) Rebuild(
 	newModels := make(map[string][]ScoredProvider)
 
 	for _, r := range results {
-		// Hard filter: must be correct, provider must be ok or degraded
+		// Hard filter: the individual model check must have passed
 		if !r.Correct || r.Status != "ok" {
-			continue
-		}
-		pStatus := statusByID[r.ProviderID]
-		if pStatus != "ok" && pStatus != "degraded" {
 			continue
 		}
 
@@ -114,12 +112,29 @@ func (rt *RoutingTable) Rebuild(
 		}
 
 		// Score: 0.4 × latency + 0.3 × health + 0.3 × fingerprint
+		// Provider-level health feeds into the score as a continuous factor,
+		// NOT as a hard gate. A provider with health=40% gets a lower score
+		// but its individually-correct models still enter the routing table.
 		latencyScore := 1.0 - clamp(float64(r.LatencyMs)/30000.0, 0, 1)
 		healthScore := healthByID[r.ProviderID] / 100.0
+
+		// Providers in error/down state get an additional penalty but are not excluded.
+		// This keeps their correct models routable at reduced priority.
+		pStatus := statusByID[r.ProviderID]
+		providerPenalty := 1.0
+		if pStatus == "error" {
+			providerPenalty = 0.3
+		} else if pStatus == "down" {
+			providerPenalty = 0.5
+		} else if pStatus == "degraded" {
+			providerPenalty = 0.8
+		}
 		fpScore := 0.5 // default when no fingerprint data
+		fpVerdict := ""
 		fpKey := [2]string{r.ProviderName, r.Model}
 		if fp, ok := fingerprints[fpKey]; ok {
 			fpScore = clamp(float64(fp.TotalScore)/10.0, 0, 1)
+			fpVerdict = fp.Verdict
 			// Penalize suspected/fake heavily
 			if fp.Verdict == "LIKELY FAKE" || fp.Verdict == "FAIL" {
 				fpScore = 0
@@ -127,12 +142,16 @@ func (rt *RoutingTable) Rebuild(
 				fpScore *= 0.3
 			}
 		}
-		score := 0.4*latencyScore + 0.3*healthScore + 0.3*fpScore
+		baseScore := 0.4*latencyScore + 0.3*healthScore + 0.3*fpScore
+		score := baseScore
 
 		// Manual priority boost (default 1.0, set >1 to prioritize)
-		if pri := priorityByName[r.ProviderName]; pri > 0 {
-			score *= pri
+		priMul := priorityByName[r.ProviderName]
+		if priMul <= 0 {
+			priMul = 1.0
 		}
+		score *= priMul
+		score *= providerPenalty
 
 		baseURL, ok2 := urlByID[r.ProviderID]
 		if !ok2 || baseURL == "" {
@@ -149,6 +168,14 @@ func (rt *RoutingTable) Rebuild(
 			Vendor:       r.Vendor,
 			Score:        score,
 			LatencyMs:    r.LatencyMs,
+			Breakdown: ScoreBreakdown{
+				LatencyScore:       latencyScore,
+				HealthScore:        healthScore,
+				FingerprintScore:   fpScore,
+				FingerprintVerdict: fpVerdict,
+				BaseScore:          baseScore,
+				PriorityMul:        priMul,
+			},
 		}
 		if caps, ok := capabilities[r.ProviderID]; ok {
 			if cap, ok := caps[r.Model]; ok {
@@ -178,7 +205,7 @@ func (rt *RoutingTable) Rebuild(
 // Select returns an ordered list of providers for the given model and API format.
 // Breaker state and live error rates are applied dynamically at selection time.
 func (rt *RoutingTable) Select(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) []ScoredProvider {
-	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers)
+	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers, nil)
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -216,7 +243,7 @@ func (rt *RoutingTable) Select(model, apiFormat string, req RequestRequirements,
 }
 
 func (rt *RoutingTable) DebugSelection(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) []DebugCandidate {
-	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers)
+	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers, nil)
 	out := make([]DebugCandidate, len(candidates))
 	for i, candidate := range candidates {
 		debug := DebugCandidate{
@@ -249,9 +276,11 @@ func applyRequestRequirements(sp ScoredProvider, requestFormat string, req Reque
 		switch {
 		case basic != nil && !*basic:
 			return sp, 0, false
-		case basic != nil && *basic && sp.APIFormat == "responses":
 		case basic != nil && *basic:
-			matchRank += 1
+			// Capability probes trump the provider's declared wire format.
+			// If we already proved /responses works, don't force traffic onto
+			// a lower-quality "native responses" provider just because its
+			// metadata says APIFormat=responses.
 		case sp.APIFormat == "responses":
 			matchRank += 1
 		default:
@@ -304,7 +333,12 @@ func applyErrorPenalty(sp ScoredProvider, model string, stats *Stats) float64 {
 	return sp.Score * (1.0 - errorRate)
 }
 
-func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) []rankedCandidate {
+// selectionExplanation collects filtering reasons when non-nil.
+type selectionExplanation struct {
+	Filtered []FilteredEntry
+}
+
+func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers, explain *selectionExplanation) []rankedCandidate {
 	rt.mu.RLock()
 	all := rt.models[model]
 	rt.mu.RUnlock()
@@ -316,15 +350,37 @@ func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestReq
 	var candidates []rankedCandidate
 	for _, sp := range all {
 		if !matchFormat(sp.APIFormat, apiFormat) {
+			if explain != nil {
+				explain.Filtered = append(explain.Filtered, FilteredEntry{
+					ProviderID: sp.ProviderID, ProviderName: sp.ProviderName,
+					ReasonCode: "format_mismatch",
+					Detail:     fmt.Sprintf("chat request to %s-format provider", sp.APIFormat),
+				})
+			}
 			continue
 		}
 		adjusted, rank, ok := applyRequestRequirements(sp, apiFormat, req)
 		if !ok {
+			if explain != nil {
+				explain.Filtered = append(explain.Filtered, FilteredEntry{
+					ProviderID: sp.ProviderID, ProviderName: sp.ProviderName,
+					ReasonCode: "capability_unsupported",
+					Detail:     filterReasonFromRequirements(sp, apiFormat, req),
+				})
+			}
 			continue
 		}
 		if breakers != nil {
-			switch breakers.GetState(sp.ProviderID, model) {
+			state := breakers.GetState(sp.ProviderID, model)
+			switch state {
 			case BreakerOpen:
+				if explain != nil {
+					explain.Filtered = append(explain.Filtered, FilteredEntry{
+						ProviderID: sp.ProviderID, ProviderName: sp.ProviderName,
+						ReasonCode: "breaker_open",
+						Detail:     "circuit breaker open",
+					})
+				}
 				continue
 			case BreakerHalfOpen:
 				adjusted.Score *= 0.3
@@ -351,6 +407,22 @@ func (rt *RoutingTable) rankedCandidates(model, apiFormat string, req RequestReq
 		return candidates[i].Score > candidates[j].Score
 	})
 	return candidates
+}
+
+// filterReasonFromRequirements returns a human-readable explanation of why
+// capability requirements weren't met.
+func filterReasonFromRequirements(sp ScoredProvider, requestFormat string, req RequestRequirements) string {
+	toolUse, streaming, basic := capabilitiesForRequest(sp, requestFormat)
+	if requestFormat == "responses" && basic != nil && !*basic {
+		return "responses API unsupported"
+	}
+	if req.NeedsTools && toolUse != nil && !*toolUse {
+		return requestFormat + " tool_use unsupported"
+	}
+	if req.NeedsStreaming && streaming != nil && !*streaming {
+		return requestFormat + " streaming unsupported"
+	}
+	return "capability mismatch"
 }
 
 // Models returns a deduplicated list of all model names in the routing table.
@@ -481,4 +553,83 @@ func (rt *RoutingTable) DebugScores(model string) []ScoredProvider {
 	out := make([]ScoredProvider, len(src))
 	copy(out, src)
 	return out
+}
+
+// SelectWithExplanation is like Select but also returns filtering reasons for tracing.
+func (rt *RoutingTable) SelectWithExplanation(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) ([]ScoredProvider, []CandidateEntry, []FilteredEntry) {
+	var explain selectionExplanation
+	candidates := rt.rankedCandidates(model, apiFormat, req, stats, breakers, &explain)
+
+	// Build candidate entries for trace
+	var candidateEntries []CandidateEntry
+	for _, c := range candidates {
+		state := BreakerHealthy
+		if breakers != nil {
+			state = breakers.GetState(c.ProviderID, model)
+		}
+		candidateEntries = append(candidateEntries, CandidateEntry{
+			ProviderID:   c.ProviderID,
+			ProviderName: c.ProviderName,
+			Score:        c.Score,
+			MatchRank:    c.matchRank,
+			BreakerState: state.String(),
+			Breakdown:    c.Breakdown,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return nil, candidateEntries, explain.Filtered
+	}
+
+	// Same selection logic as Select
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].matchRank != candidates[j].matchRank {
+			return candidates[i].matchRank < candidates[j].matchRank
+		}
+		return candidates[i].Score > candidates[j].Score
+	})
+
+	bestRank := candidates[0].matchRank
+	var top []ScoredProvider
+	for _, candidate := range candidates {
+		if candidate.matchRank != bestRank {
+			break
+		}
+		top = append(top, candidate.ScoredProvider)
+		if len(top) == 3 {
+			break
+		}
+	}
+
+	primary := weightedSelect(top)
+	result := []ScoredProvider{primary}
+	for _, candidate := range candidates {
+		if candidate.ProviderID != primary.ProviderID {
+			result = append(result, candidate.ScoredProvider)
+		}
+	}
+	return result, candidateEntries, explain.Filtered
+}
+
+// RoutingExplanation is the full explanation for a routing decision.
+type RoutingExplanation struct {
+	Model      string           `json:"model"`
+	Endpoint   string           `json:"endpoint"`
+	Stream     bool             `json:"stream"`
+	Tools      bool             `json:"tools"`
+	Candidates []CandidateEntry `json:"candidates"`
+	Filtered   []FilteredEntry  `json:"filtered"`
+}
+
+// Explain returns a detailed explanation of the routing decision for a model+shape.
+func (rt *RoutingTable) Explain(model, apiFormat string, req RequestRequirements, stats *Stats, breakers *Breakers) *RoutingExplanation {
+	_, candidates, filtered := rt.SelectWithExplanation(model, apiFormat, req, stats, breakers)
+	return &RoutingExplanation{
+		Model:      model,
+		Endpoint:   apiFormat,
+		Stream:     req.NeedsStreaming,
+		Tools:      req.NeedsTools,
+		Candidates: candidates,
+		Filtered:   filtered,
+	}
 }

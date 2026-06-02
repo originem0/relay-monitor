@@ -48,18 +48,24 @@
     </div>
 </div>
 
+<!-- Tab Navigation -->
+<div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px">
+    <button class="proxy-tab active" onclick="switchTab('traffic')" id="tab-traffic"
+        style="padding:8px 18px;background:none;border:none;border-bottom:2px solid var(--accent);color:var(--text);font-size:0.88rem;font-weight:500;cursor:pointer">流量</button>
+    <button class="proxy-tab" onclick="switchTab('routing')" id="tab-routing"
+        style="padding:8px 18px;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);font-size:0.88rem;font-weight:500;cursor:pointer">路由表</button>
+    <button class="proxy-tab" onclick="switchTab('traces')" id="tab-traces"
+        style="padding:8px 18px;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);font-size:0.88rem;font-weight:500;cursor:pointer">请求轨迹</button>
+</div>
+
+<!-- Tab: 流量 -->
+<div id="panel-traffic">
+
 {{if .ProxyModels}}
 <h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">模型流量</h3>
 <div class="table-wrap" style="margin-bottom:24px">
     <table>
-        <thead>
-            <tr>
-                <th>模型</th>
-                <th>请求数</th>
-                <th>错误率</th>
-                <th>Provider 数</th>
-            </tr>
-        </thead>
+        <thead><tr><th>模型</th><th>请求数</th><th>错误率</th><th>Provider 数</th></tr></thead>
         <tbody>
             {{range .ProxyModels}}
             <tr>
@@ -74,19 +80,12 @@
 </div>
 {{end}}
 
-<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">最近 Provider 流量</h3>
-<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.88rem">这张表才表示最近 10 分钟实际被选中并接到请求的 Provider。</p>
+<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">Provider 流量</h3>
+<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.85rem">最近 10 分钟实际被选中的 Provider。</p>
 {{if .ProxyTraffic}}
 <div class="table-wrap" style="margin-bottom:24px">
     <table>
-        <thead>
-            <tr>
-                <th>Provider</th>
-                <th>请求数</th>
-                <th>错误率</th>
-                <th>覆盖模型数</th>
-            </tr>
-        </thead>
+        <thead><tr><th>Provider</th><th>请求数</th><th>错误率</th><th>覆盖模型数</th></tr></thead>
         <tbody>
             {{range .ProxyTraffic}}
             <tr>
@@ -101,23 +100,42 @@
 </div>
 {{else if not .ProxyWarming}}
 <div class="card" style="padding:18px 20px;margin-bottom:24px;color:var(--text-dim)">
-    最近 10 分钟暂无 Provider 流量。这个区块会固定显示在覆盖表前面；一旦有请求经过 proxy，这里就会按实际命中顺序出现。
+    最近 10 分钟暂无流量。
+</div>
+{{end}}
+
+</div>
+
+<!-- Tab: 路由表 -->
+<div id="panel-routing" style="display:none">
+
+{{if .ModelCatalog}}
+<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">可路由模型</h3>
+<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.85rem">当前能被 proxy 选中的模型。完整列表看模型页。</p>
+<div class="table-wrap" style="margin-bottom:24px">
+    <table>
+        <thead><tr><th>模型</th><th>厂商</th><th>Provider 数</th><th>最佳延迟</th><th>最佳 Provider</th></tr></thead>
+        <tbody>
+            {{range .ModelCatalog}}
+            <tr>
+                <td><code>{{.Model}}</code></td>
+                <td>{{.Vendor}}</td>
+                <td>{{.Providers}}</td>
+                <td style="font-family:var(--mono)">{{printf "%.2f" (divf .BestLatency 1000.0)}}s</td>
+                <td>{{.BestProvider}}</td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
 </div>
 {{end}}
 
 {{if .ProxyCoverage}}
 <h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">Provider 覆盖</h3>
-<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.88rem">这张表只看路由覆盖范围，不代表当前优先级。权重低、最近没流量的 Provider 也会出现在这里。</p>
+<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.85rem">路由覆盖范围，不代表优先级。</p>
 <div class="table-wrap" style="margin-bottom:24px">
     <table>
-        <thead>
-            <tr>
-                <th>Provider</th>
-                <th>路由模型数</th>
-                <th>最近请求数</th>
-                <th>最近错误率</th>
-            </tr>
-        </thead>
+        <thead><tr><th>Provider</th><th>路由模型数</th><th>最近请求数</th><th>最近错误率</th></tr></thead>
         <tbody>
             {{range .ProxyCoverage}}
             <tr>
@@ -134,40 +152,28 @@
 
 {{if and (not .ProxyCoverage) (not .ProxyWarming)}}
 <div class="card" style="padding:32px;text-align:center;color:var(--text-dim)">
-    <p>当前路由表为空，暂无可用 Provider。先跑巡检，或者修复站点状态。</p>
+    <p>路由表为空。先跑巡检。</p>
 </div>
 {{end}}
 
-{{if .ModelCatalog}}
-<h3 style="margin-bottom:10px;color:var(--text-bright);font-size:1rem">当前可路由模型</h3>
-<p style="margin:-2px 0 10px;color:var(--text-dim);font-size:0.88rem">这里只显示当前能被 proxy 选中的模型，不等于所有巡检到或已做指纹检测的模型。完整模型列表看模型页。</p>
-<div class="table-wrap" style="margin-bottom:24px">
+</div>
+
+<!-- Tab: 请求轨迹 -->
+<div id="panel-traces" style="display:none">
+
+<div id="trace-list" class="table-wrap" style="margin-bottom:24px">
     <table>
-        <thead>
-            <tr>
-                <th>模型</th>
-                <th>厂商</th>
-                <th>Provider 数</th>
-                <th>最佳延迟</th>
-                <th>最佳 Provider</th>
-            </tr>
-        </thead>
-        <tbody>
-            {{range .ModelCatalog}}
-            <tr>
-                <td><code>{{.Model}}</code></td>
-                <td>{{.Vendor}}</td>
-                <td>{{.Providers}}</td>
-                <td style="font-family:var(--mono)">{{printf "%.2f" (divf .BestLatency 1000.0)}}s</td>
-                <td>{{.BestProvider}}</td>
-            </tr>
-            {{end}}
-        </tbody>
+        <thead><tr><th>时间</th><th>模型</th><th>端点</th><th>Provider</th><th>状态</th><th>延迟</th><th>尝试</th></tr></thead>
+        <tbody id="trace-tbody"></tbody>
     </table>
+    <div id="trace-empty" style="padding:18px 20px;color:var(--text-dim);display:none">暂无请求轨迹。</div>
 </div>
-{{end}}
 
-{{end}}
+<div id="trace-detail" style="display:none;padding:20px;margin-bottom:20px" class="card"></div>
+
+</div>
+
+{{end}}{{/* closes {{else}} of ProxyEnabled */}}
 
 <script>
 function copyKey() {
@@ -179,6 +185,103 @@ function copyKey() {
         el.textContent = '已复制!';
         setTimeout(function() { el.textContent = orig; }, 1500);
     });
+}
+
+function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = s || '';
+    return d.innerHTML;
+}
+
+function switchTab(name) {
+    ['traffic','routing','traces'].forEach(function(t) {
+        document.getElementById('panel-' + t).style.display = t === name ? '' : 'none';
+        var btn = document.getElementById('tab-' + t);
+        btn.style.borderBottomColor = t === name ? 'var(--accent)' : 'transparent';
+        btn.style.color = t === name ? 'var(--text)' : 'var(--text-dim)';
+    });
+    if (name === 'traces') loadTraces();
+}
+
+var traceTimer = null;
+function loadTraces() {
+    fetch('/api/v1/proxy/traces?limit=30')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var tbody = document.getElementById('trace-tbody');
+            var empty = document.getElementById('trace-empty');
+            if (!data.traces || data.traces.length === 0) {
+                tbody.innerHTML = '';
+                empty.style.display = 'block';
+                return;
+            }
+            empty.style.display = 'none';
+            tbody.innerHTML = data.traces.map(function(t) {
+                var sc = t.final_status === 'ok' ? 'status-ok' : t.final_status === 'partial' ? 'status-degraded' : 'status-down';
+                var ts = new Date(t.received_at).toLocaleTimeString();
+                var lat = (t.latency_ms / 1000).toFixed(2) + 's';
+                var st = t.stream ? ' ⚡' : '';
+                return '<tr style="cursor:pointer" onclick="showTrace(\'' + esc(t.id || t.trace_id) + '\')">' +
+                    '<td style="font-family:var(--mono);font-size:0.82rem">' + esc(ts) + '</td>' +
+                    '<td><code>' + esc(t.model) + '</code></td>' +
+                    '<td>' + esc(t.endpoint) + st + '</td>' +
+                    '<td>' + esc(t.final_provider||'—') + '</td>' +
+                    '<td><span class="status-badge ' + sc + '">' + esc(t.final_status) + '</span></td>' +
+                    '<td style="font-family:var(--mono)">' + lat + '</td>' +
+                    '<td>' + (t.attempt_count || t.attempts || 0) + '</td></tr>';
+            }).join('');
+        }).catch(function() {});
+    clearInterval(traceTimer);
+    traceTimer = setInterval(loadTraces, 10000);
+}
+
+function showTrace(id) {
+    var d = document.getElementById('trace-detail');
+    d.style.display = 'block';
+    d.innerHTML = '<div style="color:var(--text-dim)">Loading...</div>';
+    fetch('/api/v1/proxy/traces/' + id)
+        .then(function(r) { return r.json(); })
+        .then(function(t) {
+            var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">' +
+                '<h4 style="color:var(--text-bright);font-size:0.95rem;margin:0">Trace ' + esc(t.id) + '</h4>' +
+                '<button onclick="document.getElementById(\'trace-detail\').style.display=\'none\'" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:1.1rem">&times;</button></div>';
+
+            h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:12px;margin-bottom:16px;font-size:0.85rem">' +
+                '<div><span style="color:var(--text-dim)">Model:</span> <code>' + esc(t.model) + '</code></div>' +
+                '<div><span style="color:var(--text-dim)">Endpoint:</span> ' + esc(t.endpoint) + '</div>' +
+                '<div><span style="color:var(--text-dim)">Stream:</span> ' + (t.stream?'Yes':'No') + '</div>' +
+                '<div><span style="color:var(--text-dim)">Tools:</span> ' + (t.has_tools?'Yes':'No') + '</div>' +
+                '<div><span style="color:var(--text-dim)">Status:</span> ' + esc(t.final_status) + '</div>' +
+                '<div><span style="color:var(--text-dim)">Latency:</span> ' + (t.latency_ms/1000).toFixed(2) + 's</div></div>';
+
+            if (t.attempts && t.attempts.length) {
+                h += '<h5 style="color:var(--text-bright);font-size:0.88rem;margin:0 0 8px">Attempts</h5><table style="font-size:0.82rem"><thead><tr><th>#</th><th>Provider</th><th>Score</th><th>Breaker</th><th>Result</th><th>Latency</th></tr></thead><tbody>';
+                t.attempts.forEach(function(a) {
+                    var r = a.failure ? '<span style="color:var(--down)">' + esc(a.failure) + '</span>' : '<span style="color:var(--ok)">ok</span>';
+                    h += '<tr><td>'+a.index+'</td><td>'+esc(a.provider_name)+'</td><td style="font-family:var(--mono)">'+a.score.toFixed(3)+'</td><td>'+esc(a.breaker_state)+'</td><td>'+r+'</td><td style="font-family:var(--mono)">'+(a.latency_ms/1000).toFixed(2)+'s</td></tr>';
+                });
+                h += '</tbody></table>';
+            }
+
+            if (t.candidates && t.candidates.length) {
+                h += '<h5 style="color:var(--text-bright);font-size:0.88rem;margin:12px 0 8px">Candidates ('+t.candidates.length+')</h5><table style="font-size:0.82rem"><thead><tr><th>Provider</th><th>Score</th><th>Rank</th><th>Breaker</th><th>Latency</th><th>Health</th><th>FP</th></tr></thead><tbody>';
+                t.candidates.forEach(function(c) {
+                    var b = c.breakdown||{};
+                    h += '<tr><td>'+esc(c.provider_name)+'</td><td style="font-family:var(--mono)">'+c.score.toFixed(3)+'</td><td>'+c.match_rank+'</td><td>'+esc(c.breaker_state)+'</td><td style="font-family:var(--mono)">'+(b.latency_score||0).toFixed(2)+'</td><td style="font-family:var(--mono)">'+(b.health_score||0).toFixed(2)+'</td><td style="font-family:var(--mono)">'+(b.fingerprint_score||0).toFixed(2)+'</td></tr>';
+                });
+                h += '</tbody></table>';
+            }
+
+            if (t.filtered && t.filtered.length) {
+                h += '<h5 style="color:var(--text-bright);font-size:0.88rem;margin:12px 0 8px">Filtered Out ('+t.filtered.length+')</h5><table style="font-size:0.82rem"><thead><tr><th>Provider</th><th>Reason</th><th>Detail</th></tr></thead><tbody>';
+                t.filtered.forEach(function(f) {
+                    h += '<tr><td>'+esc(f.provider_name)+'</td><td><code>'+esc(f.reason_code)+'</code></td><td>'+esc(f.detail)+'</td></tr>';
+                });
+                h += '</tbody></table>';
+            }
+
+            d.innerHTML = h;
+        }).catch(function() { d.innerHTML = '<div style="color:var(--down)">Failed to load trace</div>'; });
 }
 </script>
 {{end}}

@@ -287,10 +287,29 @@ func (s *Server) rebuildProxyTable(memProviders []provider.Provider) {
 	s.proxyRebuildMu.Lock()
 	defer s.proxyRebuildMu.Unlock()
 
-	results, _ := s.store.GetLatestResults()
-	dbProviders, _ := s.store.GetProviders()
-	caps, _ := s.store.GetAllCapabilities()
-	s.proxy.RebuildTable(results, dbProviders, memProviders, s.buildFingerprintMap(), caps)
+	// Exclude disabled providers from routing
+	var active []provider.Provider
+	for _, p := range memProviders {
+		if !p.Disabled {
+			active = append(active, p)
+		}
+	}
+
+	results, err := s.store.GetLatestResults()
+	if err != nil {
+		log.Printf("[proxy] rebuild skipped: failed to load results: %v", err)
+		return
+	}
+	dbProviders, err := s.store.GetProviders()
+	if err != nil {
+		log.Printf("[proxy] rebuild skipped: failed to load providers: %v", err)
+		return
+	}
+	caps, err := s.store.GetAllCapabilities()
+	if err != nil {
+		log.Printf("[proxy] rebuild: capabilities load failed (proceeding without): %v", err)
+	}
+	s.proxy.RebuildTable(results, dbProviders, active, s.buildFingerprintMap(), caps)
 }
 
 func checkRunModeLabel(mode checker.CheckMode) string {
@@ -305,9 +324,12 @@ func authoritativeProviderState(mode checker.CheckMode, pr *checker.ProviderResu
 		return false, false
 	}
 	if pr.Error != "" {
-		// A full run that fails before any model results are written is still authoritative
-		// about the provider being unavailable right now, so we clear the current snapshot.
-		return len(pr.Results) == 0, len(pr.Results) == 0
+		// Provider-level failure (DNS, connection refused, auth error, models list empty).
+		// Update the provider's status/error fields so the dashboard shows the problem,
+		// but do NOT clear current_results. Transient network failures should not evict
+		// previously-verified models from the routing table. The old check data stays
+		// valid until a successful check replaces it.
+		return false, true
 	}
 	if len(pr.Results) != pr.ModelsFound {
 		return false, false
@@ -391,6 +413,7 @@ type ProviderCard struct {
 	Pinned         bool
 	Note           string
 	ErrorMsg       string
+	Disabled       bool
 }
 
 // EventItem is the view model for an event in the list.
@@ -463,6 +486,7 @@ type pageData struct {
 		APIKey      string
 		AccessToken string
 		Priority    float64
+		Disabled    bool
 	}
 	Models []ModelRow
 	// Models view
@@ -556,6 +580,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /api/v1/providers", s.handleAddProvider)
 	mux.HandleFunc("DELETE /api/v1/providers/{name}", s.handleDeleteProvider)
 	mux.HandleFunc("POST /api/v1/providers/{name}/pin", s.handleTogglePin)
+	mux.HandleFunc("POST /api/v1/providers/{name}/disable", s.handleToggleDisable)
 	mux.HandleFunc("POST /api/v1/providers/{name}/note", s.handleUpdateNote)
 	mux.HandleFunc("POST /api/v1/providers/{name}/edit", s.handleEditProvider)
 	mux.HandleFunc("GET /api/v1/status", s.handleGetStatus)
@@ -569,6 +594,10 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.HandleFunc("/v1/models", s.proxy.HandleModels())
 		mux.HandleFunc("GET /proxy", s.handleProxy)
 		mux.HandleFunc("GET /api/v1/proxy/stats", s.handleProxyStats)
+		mux.HandleFunc("GET /api/v1/proxy/traces", s.handleProxyTraces)
+		mux.HandleFunc("GET /api/v1/proxy/traces/stats", s.handleProxyTraceStats)
+		mux.HandleFunc("GET /api/v1/proxy/traces/{id}", s.handleProxyTraceDetail)
+		mux.HandleFunc("POST /api/v1/routing/explain", s.handleRoutingExplain)
 	}
 
 	s.httpSrv = &http.Server{
@@ -607,6 +636,15 @@ func (s *Server) SetProxy(p *proxy.Proxy) {
 
 // RunCheckAndStore runs a check, persists results per-provider as they complete.
 func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider, triggerType string, mode checker.CheckMode) {
+	// Filter out disabled providers
+	var active []provider.Provider
+	for _, p := range provs {
+		if !p.Disabled {
+			active = append(active, p)
+		}
+	}
+	provs = active
+
 	s.mu.Lock()
 	if s.isChecking {
 		s.mu.Unlock()
@@ -696,7 +734,10 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 		storeResults := toStoreCheckResults(pr.Results)
 		runSummary := summarizeProviderResults(pr.Results, pr.Error)
 		replaceCurrent, updateProviderState := authoritativeProviderState(mode, pr)
-		if err := s.store.ApplyProviderCheck(runID, pid, storeResults, replaceCurrent, updateProviderState, runSummary.Status, runSummary.Health, runSummary.ErrorMsg); err != nil {
+		// isComplete: true when we tested all models the provider has (no sampling).
+		// Only then is it safe to remove models absent from results.
+		isComplete := replaceCurrent && pr.Error == "" && len(pr.Results) == pr.ModelsFound
+		if err := s.store.ApplyProviderCheckEx(runID, pid, storeResults, replaceCurrent, isComplete, updateProviderState, runSummary.Status, runSummary.Health, runSummary.ErrorMsg); err != nil {
 			log.Printf("[store] %s: apply provider check failed: %v", pr.Provider, err)
 			return
 		}
@@ -804,6 +845,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			card.Pinned = meta.Pinned
 			card.Note = meta.Note
 			card.HasAccessToken = meta.AccessToken != ""
+			card.Disabled = meta.Disabled
 		}
 		if results, ok := provResults[dp.ID]; ok {
 			card.ModelsTotal = len(results)
@@ -1038,6 +1080,7 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		APIKey      string
 		AccessToken string
 		Priority    float64
+		Disabled    bool
 	}{
 		Name:   dp.Name,
 		Status: dp.Status,
@@ -1050,6 +1093,7 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		data.Provider.APIKey = provMeta.APIKey
 		data.Provider.AccessToken = provMeta.AccessToken
 		data.Provider.Priority = provMeta.Priority
+		data.Provider.Disabled = provMeta.Disabled
 	}
 
 	// Get stored test results for this provider
@@ -1560,6 +1604,24 @@ func (s *Server) handleTogglePin(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func (s *Server) handleToggleDisable(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	s.mu.Lock()
+	for i, p := range s.providers {
+		if p.Name == name {
+			s.providers[i].Disabled = !s.providers[i].Disabled
+			break
+		}
+	}
+	provs := make([]provider.Provider, len(s.providers))
+	copy(provs, s.providers)
+	s.mu.Unlock()
+	config.SaveProviders(s.cfg.ProvidersFile, provs)
+	s.rebuildProxyTable(provs)
+	w.Header().Set("HX-Redirect", "/provider/"+url.PathEscape(name))
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *Server) handleUpdateNote(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	r.ParseForm()
@@ -1925,4 +1987,143 @@ func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 		"models":  s.proxy.Table().Models(),
 		"stats":   snap,
 	})
+}
+
+// handleProxyTraces returns a list of recent proxy request traces.
+func (s *Server) handleProxyTraces(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil {
+		writeJSON(w, 404, map[string]string{"error": "proxy not enabled"})
+		return
+	}
+
+	tc := s.proxy.Traces()
+	st := tc.Store()
+
+	// If we have a store, query from SQLite for richer filtering
+	if st != nil {
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+				limit = n
+			}
+		}
+		offset := 0
+		if v := r.URL.Query().Get("offset"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				offset = n
+			}
+		}
+		q := store.TraceQuery{
+			Model:  r.URL.Query().Get("model"),
+			Status: r.URL.Query().Get("status"),
+			Limit:  limit,
+			Offset: offset,
+		}
+		rows, total, err := st.QueryTraces(q)
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"traces": rows, "total": total})
+		return
+	}
+
+	// Fallback: in-memory recent traces
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	recent := tc.Recent(limit)
+	writeJSON(w, 200, map[string]any{"traces": recent, "total": len(recent)})
+}
+
+// handleProxyTraceDetail returns the full detail of a single trace.
+func (s *Server) handleProxyTraceDetail(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil {
+		writeJSON(w, 404, map[string]string{"error": "proxy not enabled"})
+		return
+	}
+
+	traceID := r.PathValue("id")
+	if traceID == "" {
+		writeJSON(w, 400, map[string]string{"error": "trace ID required"})
+		return
+	}
+
+	// Try in-memory first (fast path for recent traces)
+	tc := s.proxy.Traces()
+	if trace, ok := tc.Get(traceID); ok {
+		writeJSON(w, 200, trace)
+		return
+	}
+
+	// Fall back to SQLite
+	st := tc.Store()
+	if st != nil {
+		detail, err := st.GetTraceDetail(traceID)
+		if err != nil {
+			writeJSON(w, 404, map[string]string{"error": "trace not found"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write(detail)
+		return
+	}
+
+	writeJSON(w, 404, map[string]string{"error": "trace not found"})
+}
+
+// handleProxyTraceStats returns aggregated trace statistics.
+func (s *Server) handleProxyTraceStats(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil {
+		writeJSON(w, 404, map[string]string{"error": "proxy not enabled"})
+		return
+	}
+	writeJSON(w, 200, s.proxy.Traces().Stats())
+}
+
+// handleRoutingExplain returns a detailed explanation of the routing decision.
+func (s *Server) handleRoutingExplain(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil {
+		writeJSON(w, 404, map[string]string{"error": "proxy not enabled"})
+		return
+	}
+
+	var req struct {
+		Model    string `json:"model"`
+		Endpoint string `json:"endpoint"`
+		Stream   bool   `json:"stream"`
+		Tools    bool   `json:"tools"`
+		Required bool   `json:"tool_required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.Model == "" {
+		writeJSON(w, 400, map[string]string{"error": "model is required"})
+		return
+	}
+	if req.Endpoint == "" {
+		req.Endpoint = "chat"
+	}
+
+	reqs := proxy.RequestRequirements{
+		NeedsStreaming: req.Stream,
+		NeedsTools:     req.Tools,
+		NeedsToolCall:  req.Required,
+	}
+
+	explanation := s.proxy.Table().Explain(req.Model, req.Endpoint, reqs, s.proxy.Stats(), s.proxy.Breakers())
+	writeJSON(w, 200, explanation)
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
 }

@@ -4,6 +4,7 @@
 
 <div class="provider-header">
     <h1>{{.Provider.Name}}</h1>
+    {{if .Provider.Disabled}}<span class="status-badge status-unknown" style="background:var(--error);color:#fff">已禁用</span>{{end}}
     <span class="status-badge status-{{.Provider.Status}}">{{.Provider.Status}}</span>
     <div class="health-badge {{if ge .Provider.Health 80}}health-good{{else if ge .Provider.Health 50}}health-warn{{else}}health-bad{{end}}">
         {{.Provider.Health}}
@@ -22,6 +23,12 @@
             hx-post="/api/v1/providers/{{.Provider.Name}}/pin"
             hx-swap="none">
         {{if .Provider.Pinned}}取消置顶{{else}}置顶{{end}}
+    </button>
+    <button class="btn btn-sm {{if .Provider.Disabled}}btn-primary{{else}}btn-danger{{end}}"
+            hx-post="/api/v1/providers/{{.Provider.Name}}/disable"
+            hx-swap="none"
+            {{if not .Provider.Disabled}}hx-confirm="禁用后该站点不再参与检测和路由，确认？"{{end}}>
+        {{if .Provider.Disabled}}启用检测{{else}}禁用检测{{end}}
     </button>
     <button class="btn btn-sm btn-danger"
             hx-delete="/api/v1/providers/{{.Provider.Name}}"

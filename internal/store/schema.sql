@@ -103,3 +103,21 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_unread ON events(read, created_at);
 CREATE INDEX IF NOT EXISTS idx_fp_prov_model ON fingerprint_results(provider_id, model, checked_at);
 CREATE INDEX IF NOT EXISTS idx_events_provider ON events(provider);
+
+CREATE TABLE IF NOT EXISTS proxy_traces (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_id        TEXT NOT NULL UNIQUE,
+    received_at     DATETIME NOT NULL,
+    model           TEXT NOT NULL,
+    endpoint        TEXT NOT NULL,
+    stream          BOOLEAN NOT NULL DEFAULT 0,
+    has_tools       BOOLEAN NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL,
+    final_provider  TEXT,
+    final_status    TEXT NOT NULL,
+    latency_ms      INTEGER NOT NULL,
+    detail_json     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pt_time ON proxy_traces(received_at);
+CREATE INDEX IF NOT EXISTS idx_pt_model ON proxy_traces(model, received_at);
+CREATE INDEX IF NOT EXISTS idx_pt_status ON proxy_traces(final_status, received_at);

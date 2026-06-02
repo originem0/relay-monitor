@@ -199,6 +199,7 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 	// srv.SetNotifier(notifier.New())
 
 	// Set up proxy if enabled
+	var p *proxy.Proxy
 	if cfg.Proxy.Enabled {
 		proxyCfg := cfg.Proxy
 		// Auto-generate API key if empty
@@ -206,7 +207,7 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 			proxyCfg.APIKey = "sk-relay-" + fmt.Sprintf("%d", time.Now().UnixNano())
 			log.Printf("Proxy API key (auto-generated): %s", proxyCfg.APIKey)
 		}
-		p := proxy.New(&proxyCfg, engine.Client)
+		p = proxy.New(&proxyCfg, engine.Client, st)
 		srv.SetProxy(p)
 
 		// Try to populate routing table from existing check data
@@ -251,6 +252,11 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 	// Start HTTP server (blocks until ctx cancelled)
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("server: %v", err)
+	}
+
+	// Graceful shutdown: flush pending traces before DB closes
+	if p != nil {
+		p.Traces().Stop()
 	}
 }
 

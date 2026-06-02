@@ -15,6 +15,7 @@ type Provider struct {
 	Pinned         bool    `json:"pinned,omitempty"`
 	Note           string  `json:"note,omitempty"`
 	Priority       float64 `json:"priority,omitempty"` // routing multiplier: 0=default(1.0), 2.0=double score
+	Disabled       bool    `json:"disabled,omitempty"` // skip checks and routing when true
 }
 
 // vendorPattern maps a keyword (matched case-insensitively) to a vendor name.

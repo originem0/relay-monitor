@@ -62,6 +62,9 @@ func ValidateStreamEvent(body []byte) (StreamEventFacts, error) {
 	if eventType == "" {
 		return StreamEventFacts{}, fmt.Errorf("stream event missing type")
 	}
+	if isUpstreamErrorEvent(eventType) {
+		return StreamEventFacts{}, fmt.Errorf("upstream error event: %s", streamErrorMessage(event))
+	}
 
 	facts := StreamEventFacts{}
 	for _, key := range []string{"item", "output_item"} {
@@ -89,12 +92,19 @@ func ValidateStreamEvent(body []byte) (StreamEventFacts, error) {
 			return StreamEventFacts{}, fmt.Errorf("%s missing delta", eventType)
 		}
 	case "response.output_text.done", "response.refusal.done":
-		if _, ok := event["text"].(string); !ok {
-			return StreamEventFacts{}, fmt.Errorf("%s missing text", eventType)
+		// Some OpenAI-compatible relays omit the redundant final text field on
+		// *.done events and rely on prior deltas or the later output_item.done.
+		// Treat a missing field as acceptable, but still reject wrong types.
+		if raw, exists := event["text"]; exists {
+			if _, ok := raw.(string); !ok {
+				return StreamEventFacts{}, fmt.Errorf("%s text is not a string", eventType)
+			}
 		}
 	case "response.function_call_arguments.done":
-		if _, ok := event["arguments"].(string); !ok {
-			return StreamEventFacts{}, fmt.Errorf("%s missing arguments", eventType)
+		if raw, exists := event["arguments"]; exists {
+			if _, ok := raw.(string); !ok {
+				return StreamEventFacts{}, fmt.Errorf("%s arguments is not a string", eventType)
+			}
 		}
 	}
 
@@ -105,6 +115,37 @@ func ValidateStreamEvent(body []byte) (StreamEventFacts, error) {
 	}
 
 	return facts, nil
+}
+
+func isUpstreamErrorEvent(eventType string) bool {
+	switch eventType {
+	case "error", "response.error", "response.failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func streamErrorMessage(event map[string]any) string {
+	if raw, ok := event["error"]; ok {
+		switch v := raw.(type) {
+		case string:
+			if v != "" {
+				return v
+			}
+		case map[string]any:
+			if msg, _ := v["message"].(string); msg != "" {
+				return msg
+			}
+			if typ, _ := v["type"].(string); typ != "" {
+				return typ
+			}
+		}
+	}
+	if msg, _ := event["message"].(string); msg != "" {
+		return msg
+	}
+	return "unknown upstream error"
 }
 
 func validateOutputItem(raw any, field string, index int) (bool, error) {

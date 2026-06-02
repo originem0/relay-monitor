@@ -9,3 +9,8 @@ relay-monitor.db-shm
 /tmp/
 accounts-backup-*.json
 providers.json
+
+# 备份二进制与运行日志（手动快照流产生，不进 git 也不该堆在工作区）
+*.bak
+*.log
+relay-monitor.pre-*
