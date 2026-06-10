@@ -93,6 +93,22 @@ func LoadConfig(path string) (*AppConfig, error) {
 	if err := toml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+
+	// Clamp values that would break the runtime if mis-set. A zero
+	// max_concurrency deadlocks the checker (unbuffered semaphore released only
+	// by the same goroutine); a zero/negative retention_days makes Cleanup wipe
+	// all history. Fall back to the documented defaults rather than honoring an
+	// obviously invalid value.
+	if cfg.MaxConcurrency < 1 {
+		cfg.MaxConcurrency = DefaultConfig().MaxConcurrency
+	}
+	if cfg.RetentionDays < 1 {
+		cfg.RetentionDays = DefaultConfig().RetentionDays
+	}
+	if cfg.RequestInterval.Duration < 0 {
+		cfg.RequestInterval.Duration = 0
+	}
+
 	return cfg, nil
 }
 
@@ -115,12 +131,10 @@ func LoadProviders(path string) ([]provider.Provider, error) {
 	// Deduplicate by hostname
 	seen := make(map[string]int) // hostname -> index in result
 	var providers []provider.Provider
-	changed := false
 	for _, p := range raw {
 		host := extractHost(p.BaseURL)
 		if idx, exists := seen[host]; exists {
-			// Merge: keep existing, absorb missing fields from duplicate
-			changed = true
+			// Merge: keep existing, absorb missing fields from duplicate.
 			if p.AccessToken != "" && providers[idx].AccessToken == "" {
 				providers[idx].AccessToken = p.AccessToken
 			}
@@ -133,10 +147,8 @@ func LoadProviders(path string) ([]provider.Provider, error) {
 		providers = append(providers, p)
 	}
 
-	// Auto-save if duplicates were removed
-	if changed {
-		SaveProviders(path, providers)
-	}
+	// Dedup is applied in-memory only. A read must not mutate the file on disk;
+	// persisting the deduped list is left to explicit writes (add/remove/edit).
 	return providers, nil
 }
 
@@ -148,7 +160,9 @@ func extractHost(baseURL string) string {
 	return u.Hostname()
 }
 
-// SameHost checks if two base URLs point to the same hostname.
+// SameHost checks if two base URLs point to the same hostname. Providers on the
+// same host are treated as one station (same account/key/balance) even when
+// their base paths differ (e.g. /v1 vs /v2) — see LoadProviders dedup.
 func SameHost(a, b string) bool {
 	return extractHost(a) == extractHost(b)
 }

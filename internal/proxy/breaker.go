@@ -182,7 +182,12 @@ func (b *Breakers) RecordFailure(providerID int64, model string) {
 	}
 }
 
-// ForceState overrides the breaker state. Used when scheduled checks complete.
+// ForceState overrides the breaker state directly. It is a test/diagnostic
+// helper for constructing a known state — production code drives breaker
+// transitions through Record{Success,Failure} and the time-based GetState
+// transition, not through this method. Scheduled checks deliberately do NOT
+// reset breakers: a proxy-observed failure is more recent than an 8h check, and
+// the 60s cooldown re-admits a recovered provider fast enough on its own.
 func (b *Breakers) ForceState(providerID int64, model string, state BreakerState) {
 	e := b.getOrCreate(providerID, model)
 	e.mu.Lock()

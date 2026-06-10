@@ -34,9 +34,11 @@ func (h *SSEHub) Subscribe() (chan SSEEvent, func()) {
 		h.mu.Lock()
 		delete(h.clients, ch)
 		h.mu.Unlock()
-		// Drain channel
-		for range ch {
-		}
+		// No drain needed: Publish uses non-blocking sends, so no goroutine is ever
+		// parked waiting to send on ch. Once removed from h.clients (under the write
+		// lock, which waits out any in-flight Publish), nothing else references ch.
+		// A `for range ch` here would block forever — nobody closes ch — leaking the
+		// HandleSSE goroutine and the channel on every client disconnect.
 	}
 	return ch, unsub
 }

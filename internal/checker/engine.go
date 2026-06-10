@@ -149,11 +149,7 @@ func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFor
 
 	if r.OK {
 		result.Status = "ok"
-		if len(r.Content) > 300 {
-			result.Answer = r.Content[:300]
-		} else {
-			result.Answer = r.Content
-		}
+		result.Answer = TruncateRunes(r.Content, 300)
 		result.Correct = CheckNum(r.Content, q.Expected, 0.01)
 		result.HasReasoning = r.Reasoning != ""
 	} else {
@@ -225,10 +221,7 @@ func (e *Engine) TestProvider(ctx context.Context, p provider.Provider, mode Che
 			if tr.Correct {
 				tag = "OK"
 			}
-			ans := tr.Answer
-			if len(ans) > 50 {
-				ans = ans[:50]
-			}
+			ans := TruncateRunes(tr.Answer, 50)
 			ans = strings.ReplaceAll(ans, "\n", " ")
 			extra := ""
 			if tr.HasReasoning {
@@ -238,10 +231,7 @@ func (e *Engine) TestProvider(ctx context.Context, p provider.Provider, mode Che
 				p.Name, i+1, len(models), mid, tag, ans,
 				float64(tr.LatencyMs)/1000, extra))
 		} else {
-			errMsg := tr.Error
-			if len(errMsg) > 80 {
-				errMsg = errMsg[:80]
-			}
+			errMsg := TruncateRunes(tr.Error, 80)
 			logFn(fmt.Sprintf("  %s [%d/%d] %s ... FAIL  %s",
 				p.Name, i+1, len(models), mid, errMsg))
 		}

@@ -163,6 +163,20 @@ func parseResponsesOutput(resp map[string]any) (string, string) {
 	return strings.TrimSpace(content), strings.TrimSpace(reasoning)
 }
 
+// TruncateRunes returns s truncated to at most n runes, without splitting a
+// multi-byte UTF-8 character the way a raw s[:n] byte slice would. n counts
+// runes, not bytes. Used for answers/errors that frequently contain CJK text.
+func TruncateRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
+}
+
 // strVal safely extracts a string from a map.
 func strVal(m map[string]any, key string) string {
 	if m == nil {
@@ -206,19 +220,11 @@ func DiagnoseError(code int, body string, apiKey string) string {
 		case strings.Contains(sl, "reset"):
 			return "Connection reset: possibly blocked by firewall"
 		default:
-			if len(s) > 100 {
-				s = s[:100]
-			}
-			return fmt.Sprintf("Connection failed: %s", s)
+			return fmt.Sprintf("Connection failed: %s", TruncateRunes(s, 100))
 		}
 	}
 
-	truncMsg := func(s string, n int) string {
-		if len(s) > n {
-			return s[:n]
-		}
-		return s
-	}
+	truncMsg := TruncateRunes
 
 	switch code {
 	case 401:

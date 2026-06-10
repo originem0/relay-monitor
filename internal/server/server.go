@@ -783,9 +783,13 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 			}
 		}
 
-		if replaceCurrent || updateProviderState {
-			s.rebuildProxyTable(s.providers)
-		}
+		// Routing table is rebuilt once at the end of the check (after
+		// FinishCheckRun), not per finished provider. Rebuilding per provider
+		// meant up to N full rebuilds per check — each reloading all current
+		// results, capabilities and fingerprints, serialized under
+		// proxyRebuildMu. Routing keeps serving the previous snapshot until the
+		// check finishes, which is acceptable at an 8h cadence and the runtime
+		// breaker still reacts to live failures in the meantime.
 
 		// Push per-provider SSE update so dashboard refreshes incrementally
 		s.sseHub.Publish(SSEEvent{Type: "provider_done", Data: pr.Provider})
@@ -1148,7 +1152,12 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 	prov := s.findProvider(name)
 	var allModels []string
 	if prov != nil {
-		fetched, fetchErr := s.engine.FetchModels(r.Context(), prov.BaseURL, prov.APIKey)
+		// Bound the live fetch so a slow/dead upstream can't hang this page-load
+		// handler for FetchModels' full 25s-with-retries ceiling. On timeout we
+		// fall back to the stored model list below.
+		fetchCtx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		fetched, fetchErr := s.engine.FetchModels(fetchCtx, prov.BaseURL, prov.APIKey)
+		cancel()
 		if fetchErr == nil {
 			for _, m := range fetched {
 				if !provider.ShouldSkip(m) {

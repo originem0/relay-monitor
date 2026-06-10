@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -29,6 +31,18 @@ func tprint(format string, args ...any) {
 	defer printMu.Unlock()
 	ts := time.Now().Format("15:04:05")
 	fmt.Printf("[%s] %s\n", ts, fmt.Sprintf(format, args...))
+}
+
+// randomProxyKey returns a cryptographically random proxy API key. A guessable
+// key (e.g. one derived from a timestamp) is unacceptable for a credential that
+// gates the proxy, so a crypto/rand failure is fatal rather than silently
+// downgraded to something weaker.
+func randomProxyKey() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		log.Fatalf("generate proxy key: %v", err)
+	}
+	return "sk-relay-" + hex.EncodeToString(buf[:])
 }
 
 func main() {
@@ -204,8 +218,8 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 		proxyCfg := cfg.Proxy
 		// Auto-generate API key if empty
 		if proxyCfg.APIKey == "" {
-			proxyCfg.APIKey = "sk-relay-" + fmt.Sprintf("%d", time.Now().UnixNano())
-			log.Printf("Proxy API key (auto-generated): %s", proxyCfg.APIKey)
+			proxyCfg.APIKey = randomProxyKey()
+			log.Printf("Proxy API key (auto-generated, not persisted — set proxy.api_key in config.toml to pin it): %s", proxyCfg.APIKey)
 		}
 		p = proxy.New(&proxyCfg, engine.Client, st)
 		srv.SetProxy(p)
@@ -401,15 +415,9 @@ func printReport(results []*checker.ProviderResult) {
 	vendorMap := make(map[string][]modelEntry)
 	for _, pr := range results {
 		for _, r := range pr.Results {
-			ans := r.Answer
-			if len(ans) > 40 {
-				ans = ans[:40]
-			}
+			ans := checker.TruncateRunes(r.Answer, 40)
 			ans = strings.ReplaceAll(ans, "\n", " ")
-			errMsg := r.Error
-			if len(errMsg) > 60 {
-				errMsg = errMsg[:60]
-			}
+			errMsg := checker.TruncateRunes(r.Error, 60)
 			vendorMap[r.Vendor] = append(vendorMap[r.Vendor], modelEntry{
 				provider: pr.Provider,
 				model:    r.Model,

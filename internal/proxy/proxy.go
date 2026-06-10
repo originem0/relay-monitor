@@ -35,6 +35,11 @@ type Proxy struct {
 const (
 	defaultMaxRequestBodyBytes   int64 = 8 * 1024 * 1024
 	defaultMaxResponsesBodyBytes int64 = 2 * 1024 * 1024
+	// maxResponsesRespBytes caps how much of a non-streaming /responses upstream
+	// reply the proxy buffers for validation. Generous enough for any real
+	// completion, but bounded so a malicious or broken upstream can't OOM the
+	// proxy by streaming an unbounded body into io.ReadAll.
+	maxResponsesRespBytes int64 = 32 * 1024 * 1024
 )
 
 // New creates a Proxy with the given config. The routing table starts empty.
@@ -477,11 +482,15 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 
 	if !reqMeta.Stream || resp.StatusCode != 200 {
 		if resp.StatusCode == 200 && apiFormat == "responses" {
-			respBody, err := io.ReadAll(resp.Body)
+			respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponsesRespBytes+1))
 			resp.Body.Close()
 			if err != nil {
 				log.Printf("[proxy] failed reading upstream responses body from %s: %v", url, err)
 				return forwardOutcome{result: forwardRetry, httpStatus: 200, failure: FailureUpstream5xx}
+			}
+			if int64(len(respBody)) > maxResponsesRespBytes {
+				log.Printf("[proxy] upstream /responses body from %s exceeds %d bytes, treating as failure", url, maxResponsesRespBytes)
+				return forwardOutcome{result: forwardRetry, httpStatus: 200, failure: FailureProtocolError}
 			}
 			if err := validateResponsesPayload(respBody, requiresToolCall(reqMeta.ToolChoice)); err != nil {
 				log.Printf("[proxy] malformed /responses payload from %s: %v", url, err)
