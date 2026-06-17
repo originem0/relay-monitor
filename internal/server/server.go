@@ -837,6 +837,24 @@ func (s *Server) buildFingerprintMap() map[[2]string]proxy.FingerprintScore {
 	return m
 }
 
+// providerTier groups dashboard cards by current usability for sorting (lower =
+// higher up). It separates a temporarily-down station that still has fresh usable
+// models from stale zombies and never-worked dead stations, which a raw
+// health-descending sort lumps together (health is zeroed on a failed check).
+func providerTier(c ProviderCard) int {
+	fresh := !c.CheckedAt.IsZero() && time.Since(c.CheckedAt) <= 48*time.Hour
+	switch {
+	case c.Health > 0:
+		return 0 // online, some models usable
+	case c.ModelsOK > 0 && fresh:
+		return 1 // temporarily down, but has fresh usable models
+	case c.ModelsOK > 0:
+		return 2 // zombie: usable models exist but data is stale
+	default:
+		return 3 // fully unusable
+	}
+}
+
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	data := s.basePageData("总览")
 
@@ -896,12 +914,28 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		data.Providers = append(data.Providers, card)
 	}
 
-	// Sort: pinned first, then by health descending
+	// Sort into availability tiers, then within each tier. The provider-level
+	// health field gets zeroed on a failed check (e.g. a models-list timeout),
+	// which would otherwise dump a station that still has fresh usable models
+	// (kept by the transient-error preservation in ApplyProviderCheckEx) into the
+	// same bucket as never-worked dead stations and stale zombies, sorted by name.
+	// Tiering on "fresh usable models" instead keeps a temporarily-down station
+	// visible above the truly dead ones. Pinned always floats to the top.
 	sort.Slice(data.Providers, func(i, j int) bool {
-		if data.Providers[i].Pinned != data.Providers[j].Pinned {
-			return data.Providers[i].Pinned
+		a, b := data.Providers[i], data.Providers[j]
+		if a.Pinned != b.Pinned {
+			return a.Pinned
 		}
-		return data.Providers[i].Health > data.Providers[j].Health
+		if ta, tb := providerTier(a), providerTier(b); ta != tb {
+			return ta < tb
+		}
+		if a.Health != b.Health {
+			return a.Health > b.Health
+		}
+		if a.ModelsOK != b.ModelsOK {
+			return a.ModelsOK > b.ModelsOK
+		}
+		return a.CheckedAt.After(b.CheckedAt)
 	})
 
 	// Events
