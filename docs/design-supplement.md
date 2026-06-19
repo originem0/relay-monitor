@@ -526,6 +526,9 @@ CREATE INDEX IF NOT EXISTS idx_job_runs_type ON job_runs(type, created_at);
 -- ==========================================
 -- current_results: 保留不变（语义不变，是权威快照）
 -- ==========================================
+-- 注：表结构不变；当前实现已收紧更新语义——严格反映本轮检测、同站统一 checked_at、
+-- 持久 provider 失败（模型列表为空/全站鉴权失败）清空快照、>48h 自动过期。
+-- 详见 README「当前快照 vs 历史」。
 
 -- ==========================================
 -- capability_evidence: 替代 capabilities

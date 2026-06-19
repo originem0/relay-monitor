@@ -331,6 +331,30 @@ func authoritativeProviderState(mode checker.CheckMode, pr *checker.ProviderResu
 	return true, true
 }
 
+// persistProviderResult writes one provider's check outcome to the store with the
+// correct snapshot policy, returning the run summary and whether the current
+// snapshot was authoritatively replaced (used for change detection). checkedAt is
+// the run-level timestamp stamped on every row, so all of this provider's models
+// share one coherent checked_at instead of per-row now().
+//
+//   - success (full check, all models tested): replace the snapshot verbatim.
+//   - persistent provider failure (empty model list / auth — not transient):
+//     clear the snapshot so a dead station stops appearing as usable.
+//   - transient provider failure: leave the snapshot intact (likely a blip).
+func (s *Server) persistProviderResult(runID string, pid int64, pr *checker.ProviderResult, mode checker.CheckMode, checkedAt time.Time) (providerRunSummary, bool, error) {
+	summary := summarizeProviderResults(pr.Results, pr.Error)
+	replaceCurrent, updateProvider := authoritativeProviderState(mode, pr)
+	clearCurrent := mode == checker.ModeFull && pr.Error != "" && !store.IsTransientError(pr.Error)
+	isComplete := replaceCurrent && pr.Error == "" && len(pr.Results) == pr.ModelsFound
+
+	err := s.store.ApplyProviderCheckEx(
+		runID, pid, toStoreCheckResults(pr.Results), checkedAt,
+		replaceCurrent, isComplete, clearCurrent, updateProvider,
+		summary.Status, summary.Health, summary.ErrorMsg,
+	)
+	return summary, replaceCurrent, err
+}
+
 func toStoreCheckResults(results []checker.TestResult) []store.CheckResultInput {
 	out := make([]store.CheckResultInput, 0, len(results))
 	for _, r := range results {
@@ -752,13 +776,11 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 			return
 		}
 
-		storeResults := toStoreCheckResults(pr.Results)
-		runSummary := summarizeProviderResults(pr.Results, pr.Error)
-		replaceCurrent, updateProviderState := authoritativeProviderState(mode, pr)
-		// isComplete: true when we tested all models the provider has (no sampling).
-		// Only then is it safe to remove models absent from results.
-		isComplete := replaceCurrent && pr.Error == "" && len(pr.Results) == pr.ModelsFound
-		if err := s.store.ApplyProviderCheckEx(runID, pid, storeResults, replaceCurrent, isComplete, updateProviderState, runSummary.Status, runSummary.Health, runSummary.ErrorMsg); err != nil {
+		// Each provider's results share one run-level timestamp captured when the
+		// provider finishes, so its models get a coherent checked_at.
+		checkedAt := time.Now()
+		runSummary, replaceCurrent, err := s.persistProviderResult(runID, pid, pr, mode, checkedAt)
+		if err != nil {
 			log.Printf("[store] %s: apply provider check failed: %v", pr.Provider, err)
 			return
 		}
@@ -917,10 +939,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	// Sort into availability tiers, then within each tier. The provider-level
 	// health field gets zeroed on a failed check (e.g. a models-list timeout),
 	// which would otherwise dump a station that still has fresh usable models
-	// (kept by the transient-error preservation in ApplyProviderCheckEx) into the
-	// same bucket as never-worked dead stations and stale zombies, sorted by name.
-	// Tiering on "fresh usable models" instead keeps a temporarily-down station
-	// visible above the truly dead ones. Pinned always floats to the top.
+	// (a transient provider failure keeps the snapshot — see persistProviderResult)
+	// into the same bucket as never-worked dead stations and stale zombies, sorted
+	// by name. Tiering on "fresh usable models" instead keeps a temporarily-down
+	// station visible above the truly dead ones. Pinned always floats to the top.
 	sort.Slice(data.Providers, func(i, j int) bool {
 		a, b := data.Providers[i], data.Providers[j]
 		if a.Pinned != b.Pinned {
@@ -1047,13 +1069,20 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		var bestLatency int64
 		anyCC := false
 		for _, pr := range results {
-			if pr.correct {
-				mg.AvailableCount++
-				if bestLatency == 0 || pr.latencyMs < bestLatency {
-					bestLatency = pr.latencyMs
-					mg.BestProvider = pr.providerName
-					mg.BestLatencyMs = pr.latencyMs
-				}
+			if !pr.correct {
+				continue
+			}
+			// Skip stale rows (>48h without re-verification). Cleanup purges them
+			// from the DB, but until it runs a zombie row must not win best-provider
+			// or inflate the available count. Mirrors proxy.maxRoutableAge.
+			if !pr.checkedAt.IsZero() && time.Since(pr.checkedAt) > 48*time.Hour {
+				continue
+			}
+			mg.AvailableCount++
+			if bestLatency == 0 || pr.latencyMs < bestLatency {
+				bestLatency = pr.latencyMs
+				mg.BestProvider = pr.providerName
+				mg.BestLatencyMs = pr.latencyMs
 			}
 		}
 
@@ -1310,18 +1339,8 @@ func (s *Server) handleTriggerSingleCheck(w http.ResponseWriter, r *http.Request
 		}
 	}()
 
-	runSummary := summarizeProviderResults(pr.Results, pr.Error)
-	replaceCurrent, updateProviderState := authoritativeProviderState(checker.ModeFull, pr)
-	if err := s.store.ApplyProviderCheck(
-		runID,
-		pid,
-		toStoreCheckResults(pr.Results),
-		replaceCurrent,
-		updateProviderState,
-		runSummary.Status,
-		runSummary.Health,
-		runSummary.ErrorMsg,
-	); err != nil {
+	runSummary, _, err := s.persistProviderResult(runID, pid, pr, checker.ModeFull, time.Now())
+	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"apply provider check: %s"}`, err), http.StatusInternalServerError)
 		return
 	}

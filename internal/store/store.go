@@ -84,6 +84,17 @@ func (s *Store) Cleanup(retentionDays int) error {
 	if err != nil {
 		return err
 	}
+	// Expire current_results rows not refreshed within maxStaleAge. A snapshot is
+	// "current" only if re-verified recently; without this, failed/disabled
+	// providers' rows linger for months and pollute the dashboard, model page and
+	// routing. New data from each check refreshes live providers' checked_at, so
+	// only genuinely-stale rows are removed here.
+	if _, err := s.db.Exec(
+		`DELETE FROM current_results WHERE checked_at < datetime('now', ?)`,
+		fmt.Sprintf("-%d hours", int(maxStaleAge.Hours())),
+	); err != nil {
+		return err
+	}
 	_, err = s.db.Exec(`DELETE FROM fingerprint_results WHERE checked_at < datetime('now', ? || ' days')`, -retentionDays)
 	if err != nil {
 		return err

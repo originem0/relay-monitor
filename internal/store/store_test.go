@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestApplyProviderCheckReplacesCurrentSnapshotButKeepsHistory(t *testing.T) {
@@ -209,7 +210,7 @@ func TestApplyProviderCheckPreservesCurrentOnProviderLevelError(t *testing.T) {
 	}
 }
 
-func TestApplyProviderCheckPreservesCorrectOnTransientError(t *testing.T) {
+func TestApplyProviderCheckReplacesResultsVerbatimNoPreserve(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "relay-monitor.db"))
 	if err != nil {
 		t.Fatalf("new store: %v", err)
@@ -221,7 +222,7 @@ func TestApplyProviderCheckPreservesCorrectOnTransientError(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	// First check: model is correct
+	// First check: both models correct.
 	good := []CheckResultInput{
 		{Model: "gpt-5.4", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 1000},
 		{Model: "gpt-4o", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 800},
@@ -230,7 +231,9 @@ func TestApplyProviderCheckPreservesCorrectOnTransientError(t *testing.T) {
 		t.Fatalf("apply good check: %v", err)
 	}
 
-	// Second check: gpt-5.4 returns 503 (transient), gpt-4o returns 401 (definitive)
+	// Second check: gpt-5.4 returns 503 (transient), gpt-4o returns 401.
+	// Strict-latest-snapshot policy: there is no cross-run preservation — both are
+	// recorded as failed verbatim, even the transient one.
 	bad := []CheckResultInput{
 		{Model: "gpt-5.4", Vendor: "GPT", Status: "error", Correct: false, ErrorMsg: "Server error (503): Service temporarily unavailable", LatencyMs: 200},
 		{Model: "gpt-4o", Vendor: "GPT", Status: "error", Correct: false, ErrorMsg: "Auth failed (401): Invalid API key", LatencyMs: 100},
@@ -243,24 +246,19 @@ func TestApplyProviderCheckPreservesCorrectOnTransientError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get results: %v", err)
 	}
-
 	resultMap := make(map[string]CheckResultRow)
 	for _, cr := range current {
 		resultMap[cr.Model] = cr
 	}
-
-	// gpt-5.4: transient 503 → old correct result preserved
 	if r, ok := resultMap["gpt-5.4"]; !ok {
-		t.Fatal("gpt-5.4 should still be in current_results")
-	} else if !r.Correct {
-		t.Fatalf("gpt-5.4 should still be correct (transient error preserved old), got status=%s correct=%v", r.Status, r.Correct)
-	}
-
-	// gpt-4o: definitive 401 → replaced with new error
-	if r, ok := resultMap["gpt-4o"]; !ok {
-		t.Fatal("gpt-4o should still be in current_results")
+		t.Fatal("gpt-5.4 should be in current_results")
 	} else if r.Correct {
-		t.Fatal("gpt-4o should NOT be correct (401 is definitive, old was replaced)")
+		t.Fatalf("gpt-5.4 transient failure must NOT be preserved as correct, got correct=%v", r.Correct)
+	}
+	if r, ok := resultMap["gpt-4o"]; !ok {
+		t.Fatal("gpt-4o should be in current_results")
+	} else if r.Correct {
+		t.Fatal("gpt-4o 401 must replace old correct result")
 	}
 }
 
@@ -312,51 +310,126 @@ func TestIsTransientError(t *testing.T) {
 		{"Auth failed (401): Invalid API key", false},
 		{"Permission denied (403): no access", false},
 		{"HTTP 400: Stream must be set to true", false},
+		{"models list empty", false},
 		{"", false},
 	}
 	for _, tt := range tests {
-		if got := isTransientError(tt.err); got != tt.want {
-			t.Errorf("isTransientError(%q) = %v, want %v", tt.err, got, tt.want)
+		if got := IsTransientError(tt.err); got != tt.want {
+			t.Errorf("IsTransientError(%q) = %v, want %v", tt.err, got, tt.want)
 		}
 	}
 }
 
-func TestApplyProviderCheckExpiresStalePreservedResults(t *testing.T) {
+// A persistent provider failure (clearCurrent=true) wipes the snapshot so a dead
+// station stops appearing as usable; a transient one (clearCurrent=false) keeps it.
+func TestApplyProviderCheckExClearsCurrentOnPersistentError(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "relay-monitor.db"))
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
 	defer st.Close()
 
-	providerID, err := st.UpsertProvider("stale-prov", "https://example.com/v1", "chat", "unknown")
+	pid, err := st.UpsertProvider("dead", "https://example.com/v1", "chat", "unknown")
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	// Insert a correct result with an old checked_at (3 days ago)
-	if err := st.ApplyProviderCheck("run-old", providerID, []CheckResultInput{
-		{Model: "m1", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 500},
-	}, true, true, "ok", 100, ""); err != nil {
-		t.Fatal(err)
-	}
-	// Manually backdate the checked_at to exceed maxStaleAge
-	st.db.Exec(`UPDATE current_results SET checked_at = datetime('now', '-3 days') WHERE provider_id = ? AND model = 'm1'`, providerID)
-
-	// Now apply a transient error — should NOT be preserved because the old result is too stale
-	if err := st.ApplyProviderCheck("run-new", providerID, []CheckResultInput{
-		{Model: "m1", Vendor: "GPT", Status: "error", Correct: false, ErrorMsg: "Server error (503): timeout", LatencyMs: 100},
-	}, true, true, "down", 0, ""); err != nil {
-		t.Fatal(err)
+	seed := func(run string) {
+		if err := st.ApplyProviderCheck(run, pid, []CheckResultInput{
+			{Model: "gpt-5.4", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 100},
+		}, true, true, "ok", 100, ""); err != nil {
+			t.Fatalf("seed %s: %v", run, err)
+		}
 	}
 
-	current, err := st.GetProviderResults(providerID)
+	// Persistent failure ("models list empty"): clearCurrent=true, no results.
+	seed("run-1")
+	if err := st.ApplyProviderCheckEx("run-2", pid, nil, time.Now(), false, false, true, true, "error", 0, "models list empty"); err != nil {
+		t.Fatalf("apply clear: %v", err)
+	}
+	if current, _ := st.GetProviderResults(pid); len(current) != 0 {
+		t.Fatalf("snapshot should be cleared on persistent failure, got %d rows", len(current))
+	}
+
+	// Transient failure: clearCurrent=false, snapshot preserved.
+	seed("run-3")
+	if err := st.ApplyProviderCheckEx("run-4", pid, nil, time.Now(), false, false, false, true, "error", 0, "Connection failed: timeout"); err != nil {
+		t.Fatalf("apply transient: %v", err)
+	}
+	if current, _ := st.GetProviderResults(pid); len(current) != 1 {
+		t.Fatalf("transient failure must preserve snapshot, got %d rows", len(current))
+	}
+}
+
+// All of a provider's models written in one call share the provided checked_at,
+// not per-row now() — the fix for spread-out within-provider timestamps.
+func TestApplyProviderCheckExStampsRunTimestamp(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "relay-monitor.db"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("new store: %v", err)
 	}
-	if len(current) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(current))
+	defer st.Close()
+
+	pid, err := st.UpsertProvider("ts", "https://example.com/v1", "chat", "unknown")
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
 	}
-	if current[0].Correct {
-		t.Fatal("stale correct result (>48h) should be replaced by transient error, not preserved")
+
+	want := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	if err := st.ApplyProviderCheckEx("run-1", pid, []CheckResultInput{
+		{Model: "m1", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 100},
+		{Model: "m2", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 200},
+		{Model: "m3", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 300},
+	}, want, true, true, false, true, "ok", 100, ""); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	current, err := st.GetProviderResults(pid)
+	if err != nil {
+		t.Fatalf("get results: %v", err)
+	}
+	if len(current) != 3 {
+		t.Fatalf("want 3 rows, got %d", len(current))
+	}
+	const wantStr = "2026-06-01 12:00:00"
+	for _, cr := range current {
+		if got := cr.CheckedAt.UTC().Format("2006-01-02 15:04:05"); got != wantStr {
+			t.Errorf("model %s checked_at = %s, want uniform %s", cr.Model, got, wantStr)
+		}
+	}
+}
+
+// Cleanup expires current_results rows older than maxStaleAge while keeping fresh ones.
+func TestCleanupExpiresStaleCurrentResults(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "relay-monitor.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer st.Close()
+
+	pid, err := st.UpsertProvider("expire", "https://example.com/v1", "chat", "unknown")
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := st.ApplyProviderCheck("run-1", pid, []CheckResultInput{
+		{Model: "fresh", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 100},
+		{Model: "old", Vendor: "GPT", Status: "ok", Correct: true, Answer: "42", LatencyMs: 100},
+	}, true, true, "ok", 100, ""); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := st.db.Exec(`UPDATE current_results SET checked_at = datetime('now','-3 days') WHERE provider_id = ? AND model = 'old'`, pid); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	if err := st.Cleanup(7); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	current, err := st.GetProviderResults(pid)
+	if err != nil {
+		t.Fatalf("get results: %v", err)
+	}
+	if len(current) != 1 || current[0].Model != "fresh" {
+		t.Fatalf("stale row should be expired, kept = %+v", current)
 	}
 }

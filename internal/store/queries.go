@@ -168,105 +168,110 @@ func (s *Store) InsertCheckResult(runID string, providerID int64, model, vendor,
 }
 
 // ApplyProviderCheck appends historical results and optionally replaces the provider's
-// current snapshot and provider state atomically.
+// current snapshot and provider state atomically. checked_at is stamped with the
+// current time; for a run-consistent timestamp across a provider's models use
+// ApplyProviderCheckEx directly.
 func (s *Store) ApplyProviderCheck(runID string, providerID int64, results []CheckResultInput, replaceCurrent bool, updateProviderState bool, providerStatus string, health float64, lastError string) error {
-	return s.ApplyProviderCheckEx(runID, providerID, results, replaceCurrent, true, updateProviderState, providerStatus, health, lastError)
+	return s.ApplyProviderCheckEx(runID, providerID, results, time.Now(), replaceCurrent, true, false, updateProviderState, providerStatus, health, lastError)
 }
 
-// maxStaleAge is the maximum age of a preserved correct result before it's forced to expire.
+// maxStaleAge bounds how old a current_results row may be before it's treated as
+// expired. A snapshot is "current" only if re-verified within this window; beyond
+// it the row is purged by Cleanup. Mirrors proxy.maxRoutableAge.
 const maxStaleAge = 48 * time.Hour
 
-// ApplyProviderCheckEx is the extended version of ApplyProviderCheck.
-// isComplete indicates whether results cover ALL models the provider serves
-// (safe to remove models absent from results). When false, absent models are kept.
-func (s *Store) ApplyProviderCheckEx(runID string, providerID int64, results []CheckResultInput, replaceCurrent bool, isComplete bool, updateProviderState bool, providerStatus string, health float64, lastError string) error {
+// sqliteTime formats a time the same way SQLite's datetime('now') does
+// ("YYYY-MM-DD HH:MM:SS", UTC). Binding a Go time.Time directly would store a
+// different (RFC3339-ish) layout and break string comparison/ordering against
+// existing datetime('now') rows.
+func sqliteTime(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05")
+}
+
+// ApplyProviderCheckEx appends history and updates the provider's current snapshot
+// + state atomically.
+//
+//   - checkedAt: run-level timestamp stamped on every row written this call, so a
+//     provider's models share one coherent checked_at (instead of per-row now()).
+//   - replaceCurrent: replace current_results with this run's results verbatim.
+//     There is no cross-run preservation — a model that fails this round is recorded
+//     as failed (the snapshot strictly reflects the latest check).
+//   - isComplete: results cover ALL of the provider's models, so models absent from
+//     results may be removed. When false, absent models are kept.
+//   - clearCurrent: wipe the provider's current_results entirely (used on a
+//     persistent provider-level failure — e.g. empty model list — so a dead station
+//     stops masquerading as usable). Takes precedence over replaceCurrent.
+func (s *Store) ApplyProviderCheckEx(runID string, providerID int64, results []CheckResultInput, checkedAt time.Time, replaceCurrent bool, isComplete bool, clearCurrent bool, updateProviderState bool, providerStatus string, health float64, lastError string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
+	ts := sqliteTime(checkedAt)
+
 	for _, r := range results {
 		if _, err := tx.Exec(
-			`INSERT INTO check_results (run_id, provider_id, model, vendor, status, correct, answer, latency_ms, error_msg, has_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			runID, providerID, r.Model, r.Vendor, r.Status, r.Correct, r.Answer, r.LatencyMs, r.ErrorMsg, r.HasReasoning,
+			`INSERT INTO check_results (run_id, provider_id, model, vendor, status, correct, answer, latency_ms, error_msg, has_reasoning, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			runID, providerID, r.Model, r.Vendor, r.Status, r.Correct, r.Answer, r.LatencyMs, r.ErrorMsg, r.HasReasoning, ts,
 		); err != nil {
 			return fmt.Errorf("insert historical result %d/%s: %w", providerID, r.Model, err)
 		}
 	}
 
-	if replaceCurrent {
-		// Load existing correct results with their age so we can preserve recent ones on transient failures.
-		type oldEntry struct {
-			correct   bool
-			checkedAt time.Time
+	switch {
+	case clearCurrent:
+		// Persistent provider-level failure: the station has no usable models right
+		// now. Drop the whole snapshot so it disappears from model page / routing.
+		if _, err := tx.Exec(`DELETE FROM current_results WHERE provider_id = ?`, providerID); err != nil {
+			return fmt.Errorf("clear current results %d: %w", providerID, err)
 		}
-		oldState := make(map[string]oldEntry)
-		rows, err := tx.Query(`SELECT model, correct, checked_at FROM current_results WHERE provider_id = ?`, providerID)
-		if err != nil {
-			return fmt.Errorf("load current results %d: %w", providerID, err)
-		}
-		for rows.Next() {
-			var model string
-			var correct bool
-			var checkedAt time.Time
-			if err := rows.Scan(&model, &correct, &checkedAt); err != nil {
-				rows.Close()
-				return fmt.Errorf("scan current result %d: %w", providerID, err)
-			}
-			oldState[model] = oldEntry{correct: correct, checkedAt: checkedAt}
-		}
-		rows.Close()
 
-		// Build set of models in new results
+	case replaceCurrent:
+		// Collect the provider's existing models up front so a complete check can
+		// drop models that have since disappeared from the provider's list.
+		var oldModels []string
+		if isComplete && len(results) > 0 {
+			rows, err := tx.Query(`SELECT model FROM current_results WHERE provider_id = ?`, providerID)
+			if err != nil {
+				return fmt.Errorf("load current models %d: %w", providerID, err)
+			}
+			for rows.Next() {
+				var m string
+				if err := rows.Scan(&m); err != nil {
+					rows.Close()
+					return fmt.Errorf("scan current model %d: %w", providerID, err)
+				}
+				oldModels = append(oldModels, m)
+			}
+			rows.Close()
+		}
 		newModels := make(map[string]bool, len(results))
 		for _, r := range results {
 			newModels[r.Model] = true
 		}
 
-		now := time.Now()
+		// Replace each tested model with this round's result verbatim.
 		for _, r := range results {
-			old, hasOld := oldState[r.Model]
-
-			// Decide whether to preserve the old correct result or replace with new.
-			// Preserve only when ALL of:
-			//   1. Old result was correct
-			//   2. New result is an error (not correct)
-			//   3. The error is transient (503, 429, timeout, etc.)
-			//   4. The old result is not too stale (< maxStaleAge)
-			preserve := hasOld && old.correct &&
-				!r.Correct &&
-				isTransientError(r.ErrorMsg) &&
-				now.Sub(old.checkedAt) < maxStaleAge
-
-			if preserve {
-				continue // keep old correct result
-			}
-
 			if _, err := tx.Exec(`DELETE FROM current_results WHERE provider_id = ? AND model = ?`, providerID, r.Model); err != nil {
 				return fmt.Errorf("delete current result %d/%s: %w", providerID, r.Model, err)
 			}
 			if _, err := tx.Exec(
 				`INSERT INTO current_results (provider_id, run_id, model, vendor, status, correct, answer, latency_ms, error_msg, has_reasoning, checked_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
-				providerID, runID, r.Model, r.Vendor, r.Status, r.Correct, r.Answer, r.LatencyMs, r.ErrorMsg, r.HasReasoning,
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				providerID, runID, r.Model, r.Vendor, r.Status, r.Correct, r.Answer, r.LatencyMs, r.ErrorMsg, r.HasReasoning, ts,
 			); err != nil {
 				return fmt.Errorf("insert current result %d/%s: %w", providerID, r.Model, err)
 			}
 		}
 
-		// Remove models that are no longer in the provider's model list.
-		// Only safe when results represent a complete check (not sampled).
+		// Remove models no longer in the provider's list (only safe on a complete check).
 		if isComplete && len(results) > 0 {
-			var toRemove []string
-			for model := range oldState {
+			for _, model := range oldModels {
 				if !newModels[model] {
-					toRemove = append(toRemove, model)
-				}
-			}
-			for _, model := range toRemove {
-				if _, err := tx.Exec(`DELETE FROM current_results WHERE provider_id = ? AND model = ?`, providerID, model); err != nil {
-					return fmt.Errorf("remove stale model %d/%s: %w", providerID, model, err)
+					if _, err := tx.Exec(`DELETE FROM current_results WHERE provider_id = ? AND model = ?`, providerID, model); err != nil {
+						return fmt.Errorf("remove stale model %d/%s: %w", providerID, model, err)
+					}
 				}
 			}
 		}
@@ -284,13 +289,16 @@ func (s *Store) ApplyProviderCheckEx(runID string, providerID int64, results []C
 	return tx.Commit()
 }
 
-// isTransientError returns true for errors that are likely temporary
-// and should not evict a previously-correct model from current_results.
+// IsTransientError returns true for errors that are likely temporary (transient
+// network / 5xx / timeout) rather than persistent (auth failure, empty model
+// list, 404). Used to decide whether a provider-level failure should clear the
+// current snapshot (persistent → the station is really down) or leave it intact
+// (transient → probably a passing network blip).
 //
 // COUPLING NOTE: These prefixes must match the error messages generated by
 // checker.DiagnoseError (internal/checker/chat.go). If error message formats
 // change there, update the prefixes here accordingly.
-func isTransientError(errMsg string) bool {
+func IsTransientError(errMsg string) bool {
 	if errMsg == "" {
 		return false
 	}
