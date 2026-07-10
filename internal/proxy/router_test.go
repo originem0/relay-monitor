@@ -684,6 +684,25 @@ func TestRoutePausedExcludedFromRouting(t *testing.T) {
 	}
 }
 
+func TestCLIAutoRoutingKeepsCodexAndExcludesClaude(t *testing.T) {
+	rt := NewRoutingTable()
+	results := []store.CheckResultRow{
+		{ProviderID: 1, ProviderName: "cli", Model: "gpt-5.6-sol", Vendor: "GPT", Status: "ok", Correct: true, LatencyMs: 100},
+		{ProviderID: 1, ProviderName: "cli", Model: "sonnet5", Vendor: "Claude", Status: "ok", Correct: true, LatencyMs: 100},
+	}
+	dbProviders := []store.ProviderRow{{ID: 1, Name: "cli", BaseURL: "https://cli.example.com/v1", Status: "ok", Health: 100, APIFormat: "chat"}}
+	memProviders := []provider.Provider{{Name: "cli", APIKey: "k", ClientMode: provider.ClientModeAuto}}
+
+	rt.Rebuild(results, dbProviders, memProviders, nil, nil)
+	codex := rt.Select("gpt-5.6-sol", "responses", RequestRequirements{}, nil, nil)
+	if len(codex) != 1 || codex[0].APIFormat != "responses" || codex[0].ClientProfile.Mode != provider.ClientModeCodex {
+		t.Fatalf("Codex candidates = %#v", codex)
+	}
+	if claude := rt.Select("sonnet5", "chat", RequestRequirements{}, nil, nil); len(claude) != 0 {
+		t.Fatalf("Claude Messages provider leaked into OpenAI proxy: %#v", claude)
+	}
+}
+
 func TestScoreBreakdownPopulated(t *testing.T) {
 	rt := NewRoutingTable()
 	results, dbProviders, memProviders := makeTestData()

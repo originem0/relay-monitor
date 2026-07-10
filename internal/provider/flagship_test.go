@@ -57,3 +57,14 @@ func TestPickFlagshipsPrefersNewerCoreModelOverKeywordBoost(t *testing.T) {
 		t.Fatalf("GPT flagship = %s, want gpt-5.4", got["GPT"])
 	}
 }
+
+func TestResolveClientModeAutoUsesClaudeFamilyNames(t *testing.T) {
+	for _, model := range []string{"claude-sonnet-4.6", "sonnet5", "opus4.8", "haiku-3.5"} {
+		if got := ResolveClientMode(ClientModeAuto, model); got != ClientModeClaudeCode {
+			t.Errorf("ResolveClientMode(auto, %q) = %q, want %q", model, got, ClientModeClaudeCode)
+		}
+	}
+	if got := ResolveClientMode(ClientModeAuto, "gpt-5.6-sol"); got != ClientModeCodex {
+		t.Fatalf("ResolveClientMode(auto, gpt-5.6-sol) = %q, want %q", got, ClientModeCodex)
+	}
+}

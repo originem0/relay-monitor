@@ -1,0 +1,30 @@
+<table class="detail-table">
+    <thead>
+        <tr>
+            <th></th>
+            <th>站点</th>
+            <th>延迟</th>
+            <th>正确</th>
+            <th>指纹</th>
+            <th>tool_use</th>
+            <th>stream</th>
+            <th>检测</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+{{range .}}<tr>
+    <td>{{if .IsBest}}<span class="best-star">&#9733;</span>{{end}}</td>
+    <td>{{.ProviderName}}</td>
+    <td>{{if .LatencyMs}}{{printf "%.1f" (divf .LatencyMs 1000.0)}}s{{else}}-{{end}}</td>
+    <td>{{if .Correct}}<span class="text-ok">&#10003;</span>{{else}}<span class="text-err">&#10007;</span>{{end}}</td>
+    <td>{{if .Verdict}}<span class="verdict-{{.VerdictClass}}">{{.Verdict}}</span> <span class="text-dim">({{.FPScore}}/10)</span>{{else if eq .FPState "sampled"}}<span class="text-dim" title="该站点做过指纹，但当前模型没进入本轮前 3 指纹目标">未抽样</span>{{else}}<span class="text-dim">未运行</span>{{end}}</td>
+    <td>{{if eq .ToolUse "true"}}<span class="text-ok">&#10003;</span>{{else if eq .ToolUse "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
+    <td>{{if eq .Streaming "true"}}<span class="text-ok">&#10003;</span>{{else if eq .Streaming "false"}}<span class="text-err">&#10007;</span>{{else}}<span class="text-dim">?</span>{{end}}</td>
+    <td title="{{.ErrorMsg}}"><span class="text-dim{{if isStale .CheckedAt}} text-err{{end}}">{{relTime .CheckedAt}}{{if isStale .CheckedAt}} &#9888;{{end}}</span></td>
+    <td>
+        <button class="btn btn-sm" data-provider="{{.ProviderName}}" data-model="{{.Model}}" data-cc="{{if .CCCompat}}1{{end}}" onclick="showConfigFromBtn(this)">配置</button>
+    </td>
+</tr>{{else}}<tr><td colspan="9" class="text-dim">没有检测记录</td></tr>{{end}}
+    </tbody>
+</table>

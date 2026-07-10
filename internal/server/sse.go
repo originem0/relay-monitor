@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // SSEEvent is a server-sent event.
@@ -75,11 +76,22 @@ func (h *SSEHub) HandleSSE(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
+	// Heartbeat: checks are 8h apart, but nginx/Cloudflare drop idle upstream
+	// connections after ~100s. A periodic comment keeps the stream alive so the
+	// browser isn't forced to reconnect between events.
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+
 	ctx := r.Context()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-heartbeat.C:
+			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		case event, ok := <-ch:
 			if !ok {
 				return

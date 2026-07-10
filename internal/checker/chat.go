@@ -5,20 +5,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"relay-monitor/internal/clientprofile"
+	"relay-monitor/internal/provider"
 )
 
 // ChatOptions controls the API call format and parameters.
 type ChatOptions struct {
-	APIFormat   string  // "chat" (default) or "responses"
-	MaxTokens  int
-	Temperature float64
+	APIFormat string // "chat" (default) or "responses"
+	Profile   clientprofile.Config
+	MaxTokens int
 }
 
-func (o ChatOptions) format() string {
+func (o ChatOptions) format(modelID string) string {
+	switch o.Profile.ModeFor(modelID) {
+	case provider.ClientModeCodex:
+		return "responses"
+	case provider.ClientModeClaudeCode:
+		return "anthropic"
+	}
 	if o.APIFormat == "responses" {
 		return "responses"
 	}
@@ -42,21 +50,29 @@ func Chat(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, pr
 	var url string
 	var payload []byte
 	var err error
+	format := opts.format(modelID)
 
-	if opts.format() == "responses" {
+	switch format {
+	case "responses":
 		url = base + "/responses"
 		payload, err = json.Marshal(map[string]any{
-			"model":       modelID,
-			"input":       []map[string]string{{"role": "user", "content": prompt}},
-			"temperature": opts.Temperature,
+			"model": modelID,
+			"input": []map[string]string{{"role": "user", "content": prompt}},
+			"store": false,
 		})
-	} else {
+	case "anthropic":
+		url = base + "/messages"
+		payload, err = json.Marshal(map[string]any{
+			"model":      modelID,
+			"messages":   []map[string]string{{"role": "user", "content": prompt}},
+			"max_tokens": opts.maxTokens(),
+		})
+	default:
 		url = base + "/chat/completions"
 		payload, err = json.Marshal(map[string]any{
-			"model":       modelID,
-			"messages":    []map[string]string{{"role": "user", "content": prompt}},
-			"max_tokens":  opts.maxTokens(),
-			"temperature": opts.Temperature,
+			"model":      modelID,
+			"messages":   []map[string]string{{"role": "user", "content": prompt}},
+			"max_tokens": opts.maxTokens(),
 		})
 	}
 	if err != nil {
@@ -69,7 +85,7 @@ func Chat(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, pr
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	opts.Profile.ApplyHeaders(req, modelID)
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -85,7 +101,23 @@ func Chat(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, pr
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, tooLarge, readErr := readLimited(resp.Body)
+	if readErr != nil {
+		return &ChatResponse{
+			OK:      false,
+			Code:    resp.StatusCode,
+			Elapsed: elapsed,
+			Error:   DiagnoseError(resp.StatusCode, readErr.Error(), apiKey),
+		}, nil
+	}
+	if tooLarge {
+		return &ChatResponse{
+			OK:      false,
+			Code:    resp.StatusCode,
+			Elapsed: elapsed,
+			Error:   errBodyTooLarge.Error(),
+		}, nil
+	}
 	bodyStr := string(body)
 
 	if resp.StatusCode != http.StatusOK {
@@ -108,9 +140,12 @@ func Chat(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, pr
 	}
 
 	var content, reasoning string
-	if opts.format() == "responses" {
+	switch format {
+	case "responses":
 		content, reasoning = parseResponsesOutput(raw)
-	} else {
+	case "anthropic":
+		content, reasoning = parseAnthropicOutput(raw)
+	default:
 		content, reasoning = parseChatOutput(raw)
 	}
 
@@ -125,6 +160,23 @@ func Chat(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, pr
 		Code:      resp.StatusCode,
 		Elapsed:   elapsed,
 	}, nil
+}
+
+// parseAnthropicOutput extracts text and thinking blocks from a Messages API
+// response while keeping the rest of the checker protocol-agnostic.
+func parseAnthropicOutput(resp map[string]any) (string, string) {
+	var content, reasoning string
+	parts, _ := resp["content"].([]any)
+	for _, p := range parts {
+		part, _ := p.(map[string]any)
+		switch strVal(part, "type") {
+		case "text":
+			content += strVal(part, "text")
+		case "thinking":
+			reasoning += strVal(part, "thinking")
+		}
+	}
+	return strings.TrimSpace(content), strings.TrimSpace(reasoning)
 }
 
 // parseChatOutput extracts content and reasoning from a /chat/completions response.
@@ -234,7 +286,14 @@ func DiagnoseError(code int, body string, apiKey string) string {
 		}
 		return fmt.Sprintf("Auth failed (401): %s%s", detail, keyHint)
 	case 403:
-		return "Permission denied (403): Key may lack access to this model/endpoint"
+		detail := truncMsg(msg, 160)
+		if detail == "" {
+			detail = truncMsg(strings.Join(strings.Fields(body), " "), 160)
+		}
+		if detail == "" {
+			detail = "key or client profile may not be allowed for this model/endpoint"
+		}
+		return fmt.Sprintf("Permission denied (403): %s", detail)
 	case 404:
 		return "Endpoint not found (404): base_url may be incorrect"
 	case 429:

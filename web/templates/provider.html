@@ -80,6 +80,30 @@
             <input type="text" name="access_token" value="{{.Provider.AccessToken}}">
         </div>
         <div class="form-group">
+            <label>API 格式</label>
+            <select name="api_format">
+                <option value="chat" {{if ne .Provider.APIFormat "responses"}}selected{{end}}>Chat Completions</option>
+                <option value="responses" {{if eq .Provider.APIFormat "responses"}}selected{{end}}>Responses API</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>客户端模式</label>
+            <select name="client_mode">
+                <option value="generic" {{if eq .Provider.ClientMode "generic"}}selected{{end}}>普通 OpenAI 兼容</option>
+                <option value="codex" {{if eq .Provider.ClientMode "codex"}}selected{{end}}>Codex CLI</option>
+                <option value="claude_code" {{if eq .Provider.ClientMode "claude_code"}}selected{{end}}>Claude Code</option>
+                <option value="auto" {{if eq .Provider.ClientMode "auto"}}selected{{end}}>CC/CX 自动（按模型切换协议）</option>
+            </select>
+        </div>
+        <details style="margin-bottom:12px">
+            <summary class="text-dim" style="cursor:pointer;font-size:0.82rem">CLI 身份覆盖</summary>
+            <div class="form-group" style="margin-top:8px"><label>Codex User-Agent</label><input type="text" name="codex_user_agent" value="{{.Provider.CodexUA}}" placeholder="留空使用内置默认值"></div>
+            <div class="form-group"><label>Codex Originator</label><input type="text" name="codex_originator" value="{{.Provider.CodexOriginator}}" placeholder="留空使用内置默认值"></div>
+            <div class="form-group"><label>Claude Code User-Agent</label><input type="text" name="claude_code_user_agent" value="{{.Provider.ClaudeCodeUA}}" placeholder="留空使用内置默认值"></div>
+            <div class="form-group"><label>Anthropic Version</label><input type="text" name="anthropic_version" value="{{.Provider.AnthropicVersion}}" placeholder="留空使用内置默认值"></div>
+            <div class="form-group"><label>Anthropic Beta</label><input type="text" name="anthropic_beta" value="{{.Provider.AnthropicBeta}}" placeholder="留空使用内置默认值"></div>
+        </details>
+        <div class="form-group">
             <label>备注</label>
             <input type="text" name="note" value="{{.Provider.Note}}">
         </div>

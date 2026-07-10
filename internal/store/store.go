@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -35,31 +37,45 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
 
-	// Add last_error column if missing (migration)
-	db.Exec(`ALTER TABLE providers ADD COLUMN last_error TEXT DEFAULT ''`)
-	db.Exec(`ALTER TABLE capabilities ADD COLUMN chat_tested_at DATETIME`)
-	db.Exec(`ALTER TABLE capabilities ADD COLUMN responses_basic BOOLEAN`)
-	db.Exec(`ALTER TABLE capabilities ADD COLUMN responses_streaming BOOLEAN`)
-	db.Exec(`ALTER TABLE capabilities ADD COLUMN responses_tool_use BOOLEAN`)
-	db.Exec(`ALTER TABLE capabilities ADD COLUMN responses_tested_at DATETIME`)
-	db.Exec(`UPDATE capabilities SET responses_basic = 1 WHERE responses_basic IS NULL AND (responses_streaming = 1 OR responses_tool_use = 1)`)
-	db.Exec(`UPDATE capabilities SET chat_tested_at = tested_at WHERE chat_tested_at IS NULL AND (streaming IS NOT NULL OR tool_use IS NOT NULL)`)
-	db.Exec(`UPDATE capabilities SET responses_tested_at = tested_at WHERE responses_tested_at IS NULL AND (responses_basic IS NOT NULL OR responses_streaming IS NOT NULL OR responses_tool_use IS NOT NULL)`)
+	// Idempotent column-add migrations. addColumn ignores the expected
+	// "duplicate column" error (the column already exists) but surfaces anything
+	// else — a real migration failure used to be swallowed here, silently leaving
+	// the schema wrong until an INSERT failed with "no such column".
+	migrations := []string{
+		`ALTER TABLE providers ADD COLUMN last_error TEXT DEFAULT ''`,
+		`ALTER TABLE capabilities ADD COLUMN chat_tested_at DATETIME`,
+		`ALTER TABLE capabilities ADD COLUMN responses_basic BOOLEAN`,
+		`ALTER TABLE capabilities ADD COLUMN responses_streaming BOOLEAN`,
+		`ALTER TABLE capabilities ADD COLUMN responses_tool_use BOOLEAN`,
+		`ALTER TABLE capabilities ADD COLUMN responses_tested_at DATETIME`,
+		`ALTER TABLE fingerprint_results ADD COLUMN l1 INTEGER`,
+		`ALTER TABLE fingerprint_results ADD COLUMN l2 INTEGER`,
+		`ALTER TABLE fingerprint_results ADD COLUMN l3 INTEGER`,
+		`ALTER TABLE fingerprint_results ADD COLUMN l4 INTEGER`,
+		`ALTER TABLE fingerprint_results ADD COLUMN expected_tier TEXT`,
+		`ALTER TABLE fingerprint_results ADD COLUMN expected_min INTEGER`,
+		`ALTER TABLE fingerprint_results ADD COLUMN self_id_verdict TEXT`,
+		`ALTER TABLE fingerprint_results ADD COLUMN self_id_detail TEXT`,
+		`ALTER TABLE fingerprint_results ADD COLUMN answers_json TEXT`,
+	}
+	for _, stmt := range migrations {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate schema (%s): %w", stmt, err)
+		}
+	}
 
-	// fingerprint_results gained columns over time. CREATE TABLE IF NOT EXISTS does
-	// not alter a pre-existing table, so add the nullable columns idempotently —
-	// duplicate-column errors are ignored, matching the capabilities migration above.
-	// Without this, an old DB missing these columns makes every InsertFingerprintResult
-	// fail with "no such column", silently dropping fingerprint results.
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN l1 INTEGER`)
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN l2 INTEGER`)
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN l3 INTEGER`)
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN l4 INTEGER`)
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN expected_tier TEXT`)
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN expected_min INTEGER`)
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN self_id_verdict TEXT`)
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN self_id_detail TEXT`)
-	db.Exec(`ALTER TABLE fingerprint_results ADD COLUMN answers_json TEXT`)
+	// Backfill migrations (idempotent UPDATEs); a failure here is worth surfacing.
+	backfills := []string{
+		`UPDATE capabilities SET responses_basic = 1 WHERE responses_basic IS NULL AND (responses_streaming = 1 OR responses_tool_use = 1)`,
+		`UPDATE capabilities SET chat_tested_at = tested_at WHERE chat_tested_at IS NULL AND (streaming IS NOT NULL OR tool_use IS NOT NULL)`,
+		`UPDATE capabilities SET responses_tested_at = tested_at WHERE responses_tested_at IS NULL AND (responses_basic IS NOT NULL OR responses_streaming IS NOT NULL OR responses_tool_use IS NOT NULL)`,
+	}
+	for _, stmt := range backfills {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Printf("[store] backfill migration failed: %v", err)
+		}
+	}
 
 	s := &Store{db: db}
 	if err := s.AbortRunningCheckRuns("aborted during restart"); err != nil {
@@ -110,10 +126,12 @@ func (s *Store) Cleanup(retentionDays int) error {
 		return err
 	}
 	// VACUUM rewrites the entire DB file and holds a write lock throughout.
-	// Run it in a goroutine so it doesn't block callers (scheduler, HTTP handlers).
-	// A busy_timeout of 5 s is already set on the connection, so concurrent reads
-	// will retry rather than fail immediately.
-	go s.db.Exec(`VACUUM`) //nolint:errcheck
+	// Run it synchronously: Cleanup already executes on a background cadence,
+	// and an unsupervised `go db.Exec` discarded errors while concurrent
+	// writers silently ate busy_timeout failures with nothing in the logs.
+	if _, err := s.db.Exec(`VACUUM`); err != nil {
+		return fmt.Errorf("vacuum: %w", err)
+	}
 	return nil
 }
 

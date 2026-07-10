@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"relay-monitor/internal/clientprofile"
 	"relay-monitor/internal/provider"
 	"relay-monitor/internal/store"
 )
@@ -24,7 +25,8 @@ type ScoredProvider struct {
 	ProviderName       string
 	BaseURL            string
 	APIKey             string
-	APIFormat          string // "chat" or "responses"
+	APIFormat          string               // "chat" or "responses"
+	ClientProfile      clientprofile.Config `json:"-"` // Claude Messages providers are not routable here
 	Vendor             string
 	Score              float64
 	LatencyMs          int64
@@ -87,6 +89,7 @@ func (rt *RoutingTable) Rebuild(
 	// Build lookup maps
 	keyByName := make(map[string]string)       // provider name → API key
 	priorityByName := make(map[string]float64) // provider name → priority multiplier
+	clientProfileByName := make(map[string]clientprofile.Config)
 	for _, p := range memProviders {
 		// Disabled or route-paused providers are not routable — keep them out of
 		// the table entirely. Doing it here (rather than in callers) means every
@@ -96,6 +99,7 @@ func (rt *RoutingTable) Rebuild(
 		}
 		keyByName[p.Name] = p.APIKey
 		priorityByName[p.Name] = p.Priority
+		clientProfileByName[p.Name] = p.ClientProfile()
 	}
 	healthByID := make(map[int64]float64)
 	statusByID := make(map[int64]string)
@@ -128,6 +132,14 @@ func (rt *RoutingTable) Rebuild(
 
 		apiKey, ok := keyByName[r.ProviderName]
 		if !ok || apiKey == "" {
+			continue
+		}
+		profile := clientProfileByName[r.ProviderName]
+		resolvedClientMode := profile.ModeFor(r.Model)
+		// The public proxy speaks OpenAI Chat/Responses. A Claude Code upstream
+		// requires Anthropic Messages conversion, so admitting it here would make
+		// a successful health check become a guaranteed runtime failure.
+		if resolvedClientMode == provider.ClientModeClaudeCode {
 			continue
 		}
 
@@ -179,15 +191,20 @@ func (rt *RoutingTable) Rebuild(
 			continue
 		}
 
+		effectiveFormat := formatByID[r.ProviderID]
+		if resolvedClientMode == provider.ClientModeCodex {
+			effectiveFormat = "responses"
+		}
 		sp := ScoredProvider{
-			ProviderID:   r.ProviderID,
-			ProviderName: r.ProviderName,
-			BaseURL:      baseURL,
-			APIKey:       apiKey,
-			APIFormat:    formatByID[r.ProviderID],
-			Vendor:       r.Vendor,
-			Score:        score,
-			LatencyMs:    r.LatencyMs,
+			ProviderID:    r.ProviderID,
+			ProviderName:  r.ProviderName,
+			BaseURL:       baseURL,
+			APIKey:        apiKey,
+			APIFormat:     effectiveFormat,
+			ClientProfile: profile.WithMode(resolvedClientMode),
+			Vendor:        r.Vendor,
+			Score:         score,
+			LatencyMs:     r.LatencyMs,
 			Breakdown: ScoreBreakdown{
 				LatencyScore:       latencyScore,
 				HealthScore:        healthScore,
@@ -230,14 +247,8 @@ func (rt *RoutingTable) Select(model, apiFormat string, req RequestRequirements,
 		return nil
 	}
 
-	// Prefer better capability matches first, then better quality within the same tier.
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].matchRank != candidates[j].matchRank {
-			return candidates[i].matchRank < candidates[j].matchRank
-		}
-		return candidates[i].Score > candidates[j].Score
-	})
-
+	// candidates already arrive sorted by (matchRank asc, score desc) from
+	// rankedCandidates — no need to re-sort here.
 	bestRank := candidates[0].matchRank
 	var top []ScoredProvider
 	for _, candidate := range candidates {
@@ -557,11 +568,22 @@ func weightedSelect(candidates []ScoredProvider) ScoredProvider {
 		return candidates[0]
 	}
 
-	// 90% pick the best, 10% probe a random alternative (health awareness)
-	if rand.Float64() < 0.9 {
-		return candidates[0] // already sorted by score desc
+	// 90% pick the best; 10% probe an alternative for health awareness. But only
+	// explore among alternatives within 50% of the best score — otherwise a lone
+	// weak straggler (e.g. a flaky or fingerprint-penalized provider scoring an
+	// order of magnitude lower) would soak up 10% of live traffic for no reason.
+	best := candidates[0].Score // already sorted by score desc
+	floor := best * 0.5
+	var eligible []ScoredProvider
+	for _, c := range candidates[1:] {
+		if c.Score >= floor {
+			eligible = append(eligible, c)
+		}
 	}
-	return candidates[1+rand.Intn(len(candidates)-1)]
+	if len(eligible) == 0 || rand.Float64() < 0.9 {
+		return candidates[0]
+	}
+	return eligible[rand.Intn(len(eligible))]
 }
 
 func clamp(v, min, max float64) float64 {
@@ -630,14 +652,8 @@ func (rt *RoutingTable) SelectWithExplanation(model, apiFormat string, req Reque
 		return nil, candidateEntries, explain.Filtered, false
 	}
 
-	// Same selection logic as Select
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].matchRank != candidates[j].matchRank {
-			return candidates[i].matchRank < candidates[j].matchRank
-		}
-		return candidates[i].Score > candidates[j].Score
-	})
-
+	// Same selection logic as Select. candidates are already sorted by
+	// (matchRank asc, score desc) from rankedCandidates.
 	bestRank := candidates[0].matchRank
 	var top []ScoredProvider
 	for _, candidate := range candidates {

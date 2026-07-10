@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"fmt"
 	"sync"
 	"time"
 )
@@ -50,7 +49,7 @@ const (
 
 // Breakers manages per-(provider, model) circuit breaker state.
 type Breakers struct {
-	entries sync.Map // "providerID:model" → *breakerEntry
+	entries sync.Map // breakerKey → *breakerEntry
 }
 
 func NewBreakers() *Breakers {
@@ -62,13 +61,8 @@ type breakerKey struct {
 	Model      string
 }
 
-func (b *Breakers) key(providerID int64, model string) string {
-	// Simple string key for sync.Map
-	return fmt.Sprintf("%d:%s", providerID, model)
-}
-
 func (b *Breakers) getOrCreate(providerID int64, model string) *breakerEntry {
-	k := b.key(providerID, model)
+	k := breakerKey{ProviderID: providerID, Model: model}
 	if v, ok := b.entries.Load(k); ok {
 		return v.(*breakerEntry)
 	}

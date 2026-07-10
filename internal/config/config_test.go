@@ -28,6 +28,22 @@ func TestLoadProvidersNormal(t *testing.T) {
 	}
 }
 
+func TestLoadProvidersClientMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.json")
+	os.WriteFile(path, []byte(`[
+		{"name":"CLI relay","base_url":"https://cli.example.com/v1","api_key":"sk-test","client_mode":"auto","codex_user_agent":"codex_cli_rs/9.9.9"}
+	]`), 0644)
+
+	providers, err := LoadProviders(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(providers) != 1 || providers[0].ClientMode != "auto" || providers[0].CodexUserAgent != "codex_cli_rs/9.9.9" {
+		t.Fatalf("providers = %#v", providers)
+	}
+}
+
 func TestLoadProvidersDeduplicate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "providers.json")
@@ -106,5 +122,21 @@ func TestExtractHost(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("extractHost(%q) = %q, want %q", tt.url, got, tt.want)
 		}
+	}
+}
+
+// TLS verification must be on by default: the proxy forwards paid API keys,
+// and a silent InsecureSkipVerify default hands them to any MITM. Opting out
+// stays possible via ssl_verify = false.
+func TestDefaultConfigVerifiesTLS(t *testing.T) {
+	if !DefaultConfig().SSLVerify {
+		t.Fatal("DefaultConfig().SSLVerify = false, want true")
+	}
+	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.SSLVerify {
+		t.Fatal("LoadConfig default SSLVerify = false, want true")
 	}
 }

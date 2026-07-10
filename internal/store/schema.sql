@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS current_results (
     PRIMARY KEY (provider_id, model)
 );
 CREATE INDEX IF NOT EXISTS idx_cur_run ON current_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_cur_model ON current_results(model);
 
 CREATE TABLE IF NOT EXISTS fingerprint_results (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

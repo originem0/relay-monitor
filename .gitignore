@@ -14,3 +14,5 @@ providers.json
 *.bak
 *.log
 relay-monitor.pre-*
+config.toml
+relay-monitor.bak.*

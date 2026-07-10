@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math/rand"
 	"net/http"
 	"sort"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"relay-monitor/internal/clientprofile"
 	"relay-monitor/internal/provider"
 )
 
@@ -35,7 +35,49 @@ const (
 
 // FetchModels discovers available models via /v1/models.
 // Retries up to 3 times, but not for 401/403/404.
-func (e *Engine) FetchModels(ctx context.Context, baseURL, apiKey string) ([]string, error) {
+func (e *Engine) FetchModels(ctx context.Context, baseURL, apiKey string, profile clientprofile.Config) ([]string, error) {
+	if clientprofile.NormalizeMode(profile.Mode) == clientprofile.ModeAuto {
+		// Some CC/CX relays expose a different model catalog to each official
+		// client. Fetch both identities or auto mode would silently lose one
+		// family before per-model protocol selection even runs.
+		seen := make(map[string]bool)
+		var merged []string
+		var errors []string
+		type catalogResult struct {
+			mode   string
+			models []string
+			err    error
+		}
+		results := make(chan catalogResult, 2)
+		for _, mode := range []string{clientprofile.ModeCodex, clientprofile.ModeClaudeCode} {
+			go func(mode string) {
+				models, err := e.fetchModels(ctx, baseURL, apiKey, profile.WithMode(mode))
+				results <- catalogResult{mode: mode, models: models, err: err}
+			}(mode)
+		}
+		for range 2 {
+			result := <-results
+			if result.err != nil {
+				errors = append(errors, result.mode+": "+result.err.Error())
+				continue
+			}
+			for _, model := range result.models {
+				if !seen[model] {
+					seen[model] = true
+					merged = append(merged, model)
+				}
+			}
+		}
+		if len(merged) > 0 {
+			sort.Strings(merged)
+			return merged, nil
+		}
+		return nil, fmt.Errorf("fetch models with CLI profiles failed: %s", strings.Join(errors, "; "))
+	}
+	return e.fetchModels(ctx, baseURL, apiKey, profile)
+}
+
+func (e *Engine) fetchModels(ctx context.Context, baseURL, apiKey string, profile clientprofile.Config) ([]string, error) {
 	url := strings.TrimRight(baseURL, "/") + "/models"
 
 	// Bound model-list discovery so a dead station (DNS/SSL/refused/no response)
@@ -56,7 +98,7 @@ func (e *Engine) FetchModels(ctx context.Context, baseURL, apiKey string) ([]str
 			return nil, fmt.Errorf("new request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("User-Agent", UserAgent)
+		profile.ApplyHeaders(req, "")
 
 		resp, err := e.Client.Do(req)
 		if err != nil {
@@ -66,8 +108,14 @@ func (e *Engine) FetchModels(ctx context.Context, baseURL, apiKey string) ([]str
 			return nil, fmt.Errorf("%s", DiagnoseError(0, err.Error(), apiKey))
 		}
 
-		body, _ := io.ReadAll(resp.Body)
+		body, tooLarge, readErr := readLimited(resp.Body)
 		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("%s", DiagnoseError(0, readErr.Error(), apiKey))
+		}
+		if tooLarge {
+			return nil, errBodyTooLarge
+		}
 
 		if resp.StatusCode == http.StatusOK {
 			var data struct {
@@ -103,13 +151,18 @@ func (e *Engine) FetchModels(ctx context.Context, baseURL, apiKey string) ([]str
 // TestModel runs the basic test on a single model.
 // For GPT-5+ models, tries responses API first (OpenAI's default).
 // If any format returns 400, falls back to the other format.
-func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFormat string) *TestResult {
+func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFormat string, profile clientprofile.Config) *TestResult {
 	// Pick a random question to avoid sending the same prompt to every model
 	q := RandomTestQuestion()
 
 	// GPT-5+ and codex models prefer responses API
+	resolvedMode := profile.ModeFor(modelID)
 	effectiveFormat := apiFormat
-	if effectiveFormat == "" || effectiveFormat == "chat" {
+	if resolvedMode == provider.ClientModeCodex {
+		effectiveFormat = "responses"
+	} else if resolvedMode == provider.ClientModeClaudeCode {
+		effectiveFormat = "anthropic"
+	} else if effectiveFormat == "" || effectiveFormat == "chat" {
 		low := strings.ToLower(modelID)
 		if strings.Contains(low, "gpt-5") || strings.Contains(low, "codex") {
 			effectiveFormat = "responses"
@@ -117,24 +170,24 @@ func (e *Engine) TestModel(ctx context.Context, baseURL, apiKey, modelID, apiFor
 	}
 
 	r, _ := Chat(ctx, e.Client, baseURL, apiKey, modelID, q.Prompt, ChatOptions{
-		APIFormat:   effectiveFormat,
-		MaxTokens:   200,
-		Temperature: 0,
+		APIFormat: effectiveFormat,
+		Profile:   profile.WithMode(resolvedMode),
+		MaxTokens: 200,
 	})
 
 	// If failed, try the other format. 404 is included so a model that's gone on
 	// the preferred wire format (e.g. responses) still gets checked on the other
 	// (chat) before being declared dead — capability probing records which format
 	// actually works so routing can stay format-aware.
-	if !r.OK && (r.Code == 400 || r.Code == 404 || r.Code == 500) {
+	if resolvedMode == provider.ClientModeGeneric && !r.OK && (r.Code == 400 || r.Code == 404 || r.Code == 500) {
 		altFormat := "responses"
 		if effectiveFormat == "responses" {
 			altFormat = "chat"
 		}
 		r2, _ := Chat(ctx, e.Client, baseURL, apiKey, modelID, q.Prompt, ChatOptions{
-			APIFormat:   altFormat,
-			MaxTokens:   200,
-			Temperature: 0,
+			APIFormat: altFormat,
+			Profile:   profile.WithMode(resolvedMode),
+			MaxTokens: 200,
 		})
 		if r2.OK {
 			r = r2
@@ -168,7 +221,7 @@ func (e *Engine) TestProvider(ctx context.Context, p provider.Provider, mode Che
 		BaseURL:  p.BaseURL,
 	}
 
-	allModels, err := e.FetchModels(ctx, p.BaseURL, p.APIKey)
+	allModels, err := e.FetchModels(ctx, p.BaseURL, p.APIKey, p.ClientProfile())
 	if err != nil {
 		result.Error = err.Error()
 		logFn(fmt.Sprintf("%s: %s", p.Name, err))
@@ -213,7 +266,7 @@ func (e *Engine) TestProvider(ctx context.Context, p provider.Provider, mode Che
 			break
 		}
 
-		tr := e.TestModel(ctx, p.BaseURL, p.APIKey, mid, p.APIFormat)
+		tr := e.TestModel(ctx, p.BaseURL, p.APIKey, mid, p.APIFormat, p.ClientProfile())
 		result.Results = append(result.Results, *tr)
 
 		if tr.Status == "ok" {

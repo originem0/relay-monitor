@@ -62,7 +62,7 @@ func DefaultConfig() *AppConfig {
 		RetentionDays:    7,
 		MaxConcurrency:   16,
 		RequestInterval:  Duration{2 * time.Second},
-		SSLVerify:        false,
+		SSLVerify:        true,
 		DataDir:          ".",
 		BalanceThreshold: 5.0,
 		ProvidersFile:    "providers.json",
@@ -140,6 +140,24 @@ func LoadProviders(path string) ([]provider.Provider, error) {
 			}
 			if p.LastKnownQuota > 0 && providers[idx].LastKnownQuota == 0 {
 				providers[idx].LastKnownQuota = p.LastKnownQuota
+			}
+			if p.ClientMode != "" && providers[idx].ClientMode == "" {
+				providers[idx].ClientMode = p.ClientMode
+			}
+			if p.CodexUserAgent != "" && providers[idx].CodexUserAgent == "" {
+				providers[idx].CodexUserAgent = p.CodexUserAgent
+			}
+			if p.CodexOriginator != "" && providers[idx].CodexOriginator == "" {
+				providers[idx].CodexOriginator = p.CodexOriginator
+			}
+			if p.ClaudeCodeUserAgent != "" && providers[idx].ClaudeCodeUserAgent == "" {
+				providers[idx].ClaudeCodeUserAgent = p.ClaudeCodeUserAgent
+			}
+			if p.AnthropicVersion != "" && providers[idx].AnthropicVersion == "" {
+				providers[idx].AnthropicVersion = p.AnthropicVersion
+			}
+			if p.AnthropicBeta != "" && providers[idx].AnthropicBeta == "" {
+				providers[idx].AnthropicBeta = p.AnthropicBeta
 			}
 			continue
 		}

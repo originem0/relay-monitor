@@ -4,6 +4,12 @@
     "base_url": "https://example.com/v1",
     "api_key": "sk-your-api-key-here",
     "access_token": "",
-    "api_format": "chat"
+    "api_format": "chat",
+    "client_mode": "generic",
+    "codex_user_agent": "",
+    "codex_originator": "",
+    "claude_code_user_agent": "",
+    "anthropic_version": "",
+    "anthropic_beta": ""
   }
 ]

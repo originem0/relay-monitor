@@ -338,6 +338,25 @@ func (s *Store) GetLatestResults() ([]CheckResultRow, error) {
 	return scanCheckResults(rows)
 }
 
+// GetResultsByModel returns the current check result for one model across all
+// providers. Narrower than GetLatestResults so per-model views (the on-demand
+// provider-rows fragment) don't scan every provider's full snapshot.
+func (s *Store) GetResultsByModel(model string) ([]CheckResultRow, error) {
+	rows, err := s.db.Query(`
+		SELECT 0 AS id, cr.run_id, cr.provider_id, p.name, cr.model, cr.vendor, cr.status, cr.correct,
+		       COALESCE(cr.answer, ''), cr.latency_ms, COALESCE(cr.error_msg, ''), cr.has_reasoning, cr.checked_at
+		FROM current_results cr
+		JOIN providers p ON p.id = cr.provider_id
+		WHERE cr.model = ?
+		ORDER BY p.name
+	`, model)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCheckResults(rows)
+}
+
 // GetProviderResults returns the most recent results for a specific provider.
 func (s *Store) GetProviderResults(providerID int64) ([]CheckResultRow, error) {
 	rows, err := s.db.Query(`

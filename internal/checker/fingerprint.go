@@ -8,11 +8,12 @@ import (
 	"strings"
 	"time"
 
+	"relay-monitor/internal/clientprofile"
 	"relay-monitor/internal/provider"
 )
 
 // FingerprintModel runs the 10-question fingerprint + self-ID probe on a single model.
-func (e *Engine) FingerprintModel(ctx context.Context, baseURL, apiKey, modelID, apiFormat string) *FingerprintResult {
+func (e *Engine) FingerprintModel(ctx context.Context, baseURL, apiKey, modelID, apiFormat string, profile clientprofile.Config) *FingerprintResult {
 	r := &FingerprintResult{
 		Model:   modelID,
 		Vendor:  provider.IdentifyVendor(modelID),
@@ -21,9 +22,9 @@ func (e *Engine) FingerprintModel(ctx context.Context, baseURL, apiKey, modelID,
 	}
 
 	opts := ChatOptions{
-		APIFormat:   apiFormat,
-		MaxTokens:   200,
-		Temperature: 0,
+		APIFormat: apiFormat,
+		Profile:   profile.WithMode(profile.ModeFor(modelID)),
+		MaxTokens: 200,
 	}
 
 	gateFailed := false
@@ -198,7 +199,7 @@ const fingerprintModelsPerVendor = 3
 // RunFingerprintAll runs fingerprint on the given provider's top-ranked models.
 // Returns results for each model tested.
 func (e *Engine) RunFingerprintAll(ctx context.Context, client *http.Client, p provider.Provider, logFn func(string)) []*FingerprintResult {
-	models, err := e.FetchModels(ctx, p.BaseURL, p.APIKey)
+	models, err := e.FetchModels(ctx, p.BaseURL, p.APIKey, p.ClientProfile())
 	if err != nil {
 		logFn(fmt.Sprintf("[fingerprint] %s: failed to fetch models: %v", p.Name, err))
 		return nil
@@ -221,7 +222,7 @@ func (e *Engine) RunFingerprintAll(ctx context.Context, client *http.Client, p p
 		}
 		logFn(fmt.Sprintf("[fingerprint] %s [%d/%d] %s (%s)...", p.Name, i+1, len(targets), target.Model, target.Vendor))
 
-		fr := e.FingerprintModel(ctx, p.BaseURL, p.APIKey, target.Model, p.APIFormat)
+		fr := e.FingerprintModel(ctx, p.BaseURL, p.APIKey, target.Model, p.APIFormat, p.ClientProfile())
 		fr.Provider = p.Name
 		results = append(results, fr)
 

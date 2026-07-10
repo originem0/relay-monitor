@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -459,5 +460,202 @@ func TestProxyRequestRetriesNextProviderOnUpstream413(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "healthy") {
 		t.Fatalf("body = %q, want healthy upstream payload", rec.Body.String())
+	}
+}
+
+func TestProxyForwardsCodexClientIdentity(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != "codex_cli_rs/9.9.9" {
+			t.Fatalf("User-Agent = %q", got)
+		}
+		if got := r.Header.Get("originator"); got != "future_codex" {
+			t.Fatalf("originator = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}`))
+	}))
+	defer upstream.Close()
+
+	p := New(newTestProxyCfg(), upstream.Client(), nil)
+	defer p.Traces().Stop()
+	p.RebuildTable(
+		[]store.CheckResultRow{{ProviderID: 1, ProviderName: "codex", Model: "gpt-5.6-sol", Vendor: "GPT", Status: "ok", Correct: true, LatencyMs: 10}},
+		[]store.ProviderRow{{ID: 1, Name: "codex", BaseURL: upstream.URL, Status: "ok", Health: 100, APIFormat: "chat"}},
+		[]provider.Provider{{Name: "codex", BaseURL: upstream.URL, APIKey: "key", ClientMode: provider.ClientModeCodex, CodexUserAgent: "codex_cli_rs/9.9.9", CodexOriginator: "future_codex"}},
+		nil,
+		nil,
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	p.proxyRequest(rec, req, "responses", "/responses")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A streaming response that keeps producing chunks must not be cut off by
+// stream_first_byte_timeout: that timeout bounds time-to-first-byte only, not
+// the total stream duration (stream_idle_timeout guards mid-stream silence).
+func TestProxyStreamOutlivesFirstByteTimeout(t *testing.T) {
+	const chunks = 8
+	const chunkInterval = 60 * time.Millisecond // total ~480ms >> 150ms first-byte timeout
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		for i := 0; i < chunks; i++ {
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"chunk-%d\"}}]}\n\n", i)
+			flusher.Flush()
+			time.Sleep(chunkInterval)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	cfg := &config.ProxyConfig{
+		RequestTimeout:         config.Duration{Duration: 150 * time.Millisecond},
+		StreamFirstByteTimeout: config.Duration{Duration: 150 * time.Millisecond},
+		StreamIdleTimeout:      config.Duration{Duration: 2 * time.Second},
+	}
+	p := New(cfg, upstream.Client(), nil)
+	t.Cleanup(func() { p.Traces().Stop() })
+	p.RebuildTable(
+		[]store.CheckResultRow{{ProviderID: 1, ProviderName: "streamer", Model: "gpt-5.4", Vendor: "GPT", Status: "ok", Correct: true, LatencyMs: 10}},
+		[]store.ProviderRow{{ID: 1, Name: "streamer", BaseURL: upstream.URL, Status: "ok", Health: 100, APIFormat: "chat"}},
+		[]provider.Provider{{Name: "streamer", BaseURL: upstream.URL, APIKey: "key"}},
+		nil,
+		nil,
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	p.proxyRequest(rec, req, "chat", "/chat/completions")
+
+	body := rec.Body.String()
+	if !strings.Contains(body, fmt.Sprintf("chunk-%d", chunks-1)) {
+		t.Fatalf("stream truncated before final chunk; body = %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("stream missing [DONE]; body = %q", body)
+	}
+	if strings.Contains(body, "upstream timeout") {
+		t.Fatalf("stream reported spurious timeout; body = %q", body)
+	}
+}
+
+// The first-byte timeout must still fire when the upstream never answers.
+func TestProxyStreamFirstByteTimeoutStillFires(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // hold headers until the proxy gives up
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	cfg := &config.ProxyConfig{
+		RequestTimeout:         config.Duration{Duration: 100 * time.Millisecond},
+		StreamFirstByteTimeout: config.Duration{Duration: 100 * time.Millisecond},
+		StreamIdleTimeout:      config.Duration{Duration: 2 * time.Second},
+	}
+	p := New(cfg, upstream.Client(), nil)
+	t.Cleanup(func() { p.Traces().Stop() })
+	p.RebuildTable(
+		[]store.CheckResultRow{{ProviderID: 1, ProviderName: "silent", Model: "gpt-5.4", Vendor: "GPT", Status: "ok", Correct: true, LatencyMs: 10}},
+		[]store.ProviderRow{{ID: 1, Name: "silent", BaseURL: upstream.URL, Status: "ok", Health: 100, APIFormat: "chat"}},
+		[]provider.Provider{{Name: "silent", BaseURL: upstream.URL, APIKey: "key"}},
+		nil,
+		nil,
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	start := time.Now()
+	p.proxyRequest(rec, req, "chat", "/chat/completions")
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 after first-byte timeout", rec.Code)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("first-byte timeout took %v, want ~100ms", elapsed)
+	}
+}
+
+// A provider whose key is revoked (persistent 401) must trip the breaker.
+// Otherwise it keeps re-earning primary traffic every time the stats window
+// resets, burning one retry attempt per user request until the next check.
+func TestPersistentAuthFailureTripsBreaker(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"invalid api key"}}`, http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	p := New(newTestProxyCfg(), upstream.Client(), nil)
+	t.Cleanup(func() { p.Traces().Stop() })
+	p.RebuildTable(
+		[]store.CheckResultRow{{ProviderID: 1, ProviderName: "revoked", Model: "gpt-5.4", Vendor: "GPT", Status: "ok", Correct: true, LatencyMs: 10}},
+		[]store.ProviderRow{{ID: 1, Name: "revoked", BaseURL: upstream.URL, Status: "ok", Health: 100, APIFormat: "chat"}},
+		[]provider.Provider{{Name: "revoked", BaseURL: upstream.URL, APIKey: "dead-key"}},
+		nil,
+		nil,
+	)
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		p.proxyRequest(rec, req, "chat", "/chat/completions")
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("request %d: status = %d, want 502", i, rec.Code)
+		}
+	}
+
+	if state := p.Breakers().GetState(1, "gpt-5.4"); state != BreakerOpen {
+		t.Fatalf("breaker state after 3 auth failures = %s, want open", state)
+	}
+}
+
+// A malicious/broken upstream that streams an unbounded SSE block without an
+// event boundary (blank line) must not let blockLines grow without limit. The
+// non-streaming /responses path already caps buffering; the streaming path must
+// too. Once the accumulated block exceeds the cap the proxy aborts the stream.
+func TestPipeResponsesStreamCapsUnboundedBlock(t *testing.T) {
+	p := &Proxy{}
+	cfg := &config.ProxyConfig{
+		StreamIdleTimeout: config.Duration{Duration: 2 * time.Second},
+	}
+	// One data line ~1KB, repeated far past the cap, with NO blank line between
+	// them, so flushBlock never runs and blockLines would grow unbounded.
+	var sb strings.Builder
+	line := `data: {"type":"response.output_text.delta","delta":"` + strings.Repeat("x", 1024) + `"}`
+	for i := 0; i < maxStreamBlockBytes/1024+64; i++ {
+		sb.WriteString(line)
+		sb.WriteString("\n")
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sb.String())),
+	}
+	rec := httptest.NewRecorder()
+
+	result, _, fc := p.pipeResponsesStream(rec, resp, cfg, false)
+	if result != forwardRetry {
+		t.Fatalf("result = %v, want forwardRetry (aborted before writing)", result)
+	}
+	if fc != FailureProtocolError {
+		t.Fatalf("failure = %s, want %s", fc, FailureProtocolError)
 	}
 }

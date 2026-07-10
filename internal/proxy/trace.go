@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,13 @@ const (
 	FailureStreamBroken   FailureClass = "stream_broken"
 	FailureToolMissing    FailureClass = "tool_call_missing"
 )
+
+// persistentFailure reports failure classes that won't heal between requests
+// (revoked key, exhausted quota, model removed). They feed the circuit breaker
+// even though their individual retry severity is "mild".
+func persistentFailure(fc FailureClass) bool {
+	return fc == FailureModelGone || fc == FailureAuthFailed || fc == FailureQuotaExhausted
+}
 
 // classifyUpstreamFailure maps HTTP status to retry behavior + failure class.
 func classifyUpstreamFailure(httpStatus int) (forwardResult, FailureClass) {
@@ -290,12 +298,16 @@ func (tc *TraceCollector) run() {
 			batch = batch[:0]
 			return
 		}
-		tc.store.InsertTraces(batch)
+		if err := tc.store.InsertTraces(batch); err != nil {
+			log.Printf("[trace] insert %d traces failed: %v", len(batch), err)
+		}
 		totalInserted += int64(len(batch))
 		batch = batch[:0]
 		// Only trim when we've inserted enough to possibly exceed the limit
 		if totalInserted >= int64(tc.maxKeep)/10 {
-			tc.store.TrimTraces(tc.maxKeep)
+			if err := tc.store.TrimTraces(tc.maxKeep); err != nil {
+				log.Printf("[trace] trim to %d failed: %v", tc.maxKeep, err)
+			}
 			totalInserted = 0
 		}
 	}

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"relay-monitor/internal/checker"
+	"relay-monitor/internal/clientprofile"
 	"relay-monitor/internal/config"
 	"relay-monitor/internal/provider"
 	"relay-monitor/internal/proxy"
@@ -204,6 +205,24 @@ func runServe(ctx context.Context, cfg *config.AppConfig, engine *checker.Engine
 		log.Printf("cleanup: %v", err)
 	}
 
+	// Retention must run on a schedule, not only at startup: this is a
+	// long-lived process, and a startup-only cleanup lets check history and
+	// events grow unboundedly between restarts.
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := st.Cleanup(cfg.RetentionDays); err != nil {
+					log.Printf("cleanup: %v", err)
+				}
+			}
+		}
+	}()
+
 	// Create server
 	srv, err := server.New(cfg, st, engine, providers)
 	if err != nil {
@@ -368,7 +387,7 @@ func runListModels(ctx context.Context, engine *checker.Engine, providers []prov
 		wg.Add(1)
 		go func(i int, p provider.Provider) {
 			defer wg.Done()
-			models, err := engine.FetchModels(ctx, p.BaseURL, p.APIKey)
+			models, err := engine.FetchModels(ctx, p.BaseURL, p.APIKey, p.ClientProfile())
 			r := listResult{name: p.Name}
 			if err != nil {
 				r.err = err.Error()
@@ -518,15 +537,24 @@ func runAddProvider(path string, providers []provider.Provider, cfg *config.AppC
 		return
 	}
 	fmtStr := prompt("API format (enter=chat, r=responses): ")
+	clientStr := prompt("Client mode (enter=generic, c=codex, cc=claude_code, a=CC/CX auto): ")
 
 	entry := provider.Provider{Name: name, BaseURL: baseURL, APIKey: apiKey}
 	if strings.HasPrefix(strings.ToLower(fmtStr), "r") {
 		entry.APIFormat = "responses"
 	}
+	switch strings.ToLower(strings.TrimSpace(clientStr)) {
+	case "c", "codex":
+		entry.ClientMode = provider.ClientModeCodex
+	case "cc", "claude", "claude_code", "claude-code":
+		entry.ClientMode = provider.ClientModeClaudeCode
+	case "a", "auto":
+		entry.ClientMode = provider.ClientModeAuto
+	}
 
 	fmt.Printf("Validating %s...\n", name)
 	engine := &checker.Engine{Client: checker.NewClient(cfg.SSLVerify)}
-	models, err := engine.FetchModels(context.Background(), baseURL, apiKey)
+	models, err := engine.FetchModels(context.Background(), baseURL, apiKey, clientprofile.Config{Mode: entry.ClientMode})
 	if err != nil {
 		fmt.Printf("  %s\n", err)
 		confirm := prompt("Add anyway? (y/N): ")

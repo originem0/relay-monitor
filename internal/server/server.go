@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"relay-monitor/internal/checker"
+	"relay-monitor/internal/clientprofile"
 	"relay-monitor/internal/config"
 	"relay-monitor/internal/notifier"
 	"relay-monitor/internal/provider"
@@ -39,9 +40,13 @@ func isValidProviderName(name string) bool {
 	return true
 }
 
+func isValidHeaderOverride(value string) bool {
+	return len(value) <= 256 && !strings.ContainsAny(value, "\r\n")
+}
+
 // isClaudeModel returns true if the model name is an Anthropic Claude model.
 func isClaudeModel(model string) bool {
-	return strings.HasPrefix(strings.ToLower(model), "claude")
+	return clientprofile.IsClaudeModel(model)
 }
 
 func shouldProbeResponsesCapability(model, providerFormat string) bool {
@@ -158,9 +163,20 @@ func selectCapabilityProbeTargets(prov provider.Provider, results []checker.Test
 		seen[r.Model] = true
 
 		capRow, hasCap := capByModel[r.Model]
-		needChat := prov.APIFormat != "responses" && (!hasCap || chatCapabilityNeedsRefresh(capRow))
-		needResponses := shouldProbeResponsesCapability(r.Model, prov.APIFormat) &&
-			(!hasCap || responsesCapabilityNeedsRefresh(capRow))
+		resolvedMode := provider.ResolveClientMode(prov.ClientMode, r.Model)
+		var needChat, needResponses bool
+		switch resolvedMode {
+		case provider.ClientModeClaudeCode:
+			// Anthropic Messages capabilities are stored in the existing chat
+			// columns because they represent the same downstream-facing features.
+			needChat = !hasCap || chatCapabilityNeedsRefresh(capRow)
+		case provider.ClientModeCodex:
+			needResponses = !hasCap || responsesCapabilityNeedsRefresh(capRow)
+		default:
+			needChat = prov.APIFormat != "responses" && (!hasCap || chatCapabilityNeedsRefresh(capRow))
+			needResponses = shouldProbeResponsesCapability(r.Model, prov.APIFormat) &&
+				(!hasCap || responsesCapabilityNeedsRefresh(capRow))
+		}
 		if !needChat && !needResponses {
 			continue
 		}
@@ -261,7 +277,7 @@ func (s *Server) refreshProviderMetadataAndCapabilities(ctx context.Context, pro
 		}
 
 		if target.NeedResponses {
-			caps := checker.ProbeResponsesCapabilities(ctx, s.engine.Client, prov.BaseURL, prov.APIKey, target.Result.Model)
+			caps := checker.ProbeResponsesCapabilities(ctx, s.engine.Client, prov.BaseURL, prov.APIKey, target.Result.Model, prov.ClientProfile())
 			if caps.Basic != nil || caps.Streaming != nil || caps.ToolUse != nil {
 				if err := s.store.UpsertCapability(providerID, target.Result.Model, "responses", caps.Basic, caps.Streaming, caps.ToolUse); err != nil {
 					log.Printf("[capability] %s/%s responses update error: %v", prov.Name, target.Result.Model, err)
@@ -269,7 +285,7 @@ func (s *Server) refreshProviderMetadataAndCapabilities(ctx context.Context, pro
 			}
 		}
 		if target.NeedChat {
-			caps := checker.ProbeCapabilities(ctx, s.engine.Client, prov.BaseURL, prov.APIKey, target.Result.Model, "chat")
+			caps := checker.ProbeCapabilities(ctx, s.engine.Client, prov.BaseURL, prov.APIKey, target.Result.Model, "chat", prov.ClientProfile())
 			if caps.Streaming != nil || caps.ToolUse != nil {
 				if err := s.store.UpsertCapability(providerID, target.Result.Model, "chat", nil, caps.Streaming, caps.ToolUse); err != nil {
 					log.Printf("[capability] %s/%s chat update error: %v", prov.Name, target.Result.Model, err)
@@ -467,14 +483,11 @@ type ModelGroup struct {
 	BestLatencyMs  int64
 	BestFPScore    int
 	CCCompat       bool
-	Providers      []ModelProviderRow
 }
 
 // ModelProviderRow is one provider's data for a specific model.
 type ModelProviderRow struct {
 	ProviderName string
-	BaseURL      string
-	APIKey       string
 	Model        string
 	LatencyMs    int64
 	Correct      bool
@@ -501,17 +514,24 @@ type pageData struct {
 	Events    []EventItem
 	// Provider detail
 	Provider *struct {
-		Name        string
-		Status      string
-		Health      int
-		URL         string
-		Pinned      bool
-		Note        string
-		APIKey      string
-		AccessToken string
-		Priority    float64
-		Disabled    bool
-		RoutePaused bool
+		Name             string
+		Status           string
+		Health           int
+		URL              string
+		Pinned           bool
+		Note             string
+		APIKey           string
+		AccessToken      string
+		APIFormat        string
+		ClientMode       string
+		CodexUA          string
+		CodexOriginator  string
+		ClaudeCodeUA     string
+		AnthropicVersion string
+		AnthropicBeta    string
+		Priority         float64
+		Disabled         bool
+		RoutePaused      bool
 	}
 	Models []ModelRow
 	// Models view
@@ -612,6 +632,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// Pages
 	mux.HandleFunc("GET /{$}", s.handleDashboard)
 	mux.HandleFunc("GET /models", s.handleModels)
+	mux.HandleFunc("GET /models/providers", s.handleModelProviders)
 	mux.HandleFunc("GET /fingerprint", s.handleFingerprint)
 	mux.HandleFunc("GET /provider/add", s.handleAddProviderPage)
 	mux.HandleFunc("GET /provider/{name}", s.handleProvider)
@@ -621,6 +642,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /api/v1/check/trigger/{name}", s.handleTriggerSingleCheck)
 	mux.HandleFunc("POST /api/v1/fingerprint/trigger", s.handleTriggerFingerprint)
 	mux.HandleFunc("GET /api/v1/providers", s.handleGetProviders)
+	mux.HandleFunc("GET /api/v1/providers/{name}/config", s.handleGetProviderConfig)
 	mux.HandleFunc("POST /api/v1/providers", s.handleAddProvider)
 	mux.HandleFunc("DELETE /api/v1/providers/{name}", s.handleDeleteProvider)
 	mux.HandleFunc("POST /api/v1/providers/{name}/pin", s.handleTogglePin)
@@ -693,6 +715,7 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 	s.mu.Lock()
 	if s.isChecking {
 		s.mu.Unlock()
+		log.Printf("[check] %s check skipped: another check is already running", triggerType)
 		return
 	}
 	s.isChecking = true
@@ -837,7 +860,7 @@ func (s *Server) RunCheckAndStore(ctx context.Context, provs []provider.Provider
 
 	// Rebuild proxy routing table with fresh check data
 	if s.proxy != nil {
-		s.rebuildProxyTable(s.providers)
+		s.rebuildProxyTable(s.providersSnapshot())
 		log.Printf("[proxy] routing table rebuilt: %d models", len(s.proxy.Table().Models()))
 	}
 }
@@ -881,8 +904,14 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	data := s.basePageData("总览")
 
 	// Build provider cards from DB
-	dbProviders, _ := s.store.GetProviders()
-	latestResults, _ := s.store.GetLatestResults()
+	dbProviders, err := s.store.GetProviders()
+	if err != nil {
+		log.Printf("[dashboard] load providers failed: %v", err)
+	}
+	latestResults, err := s.store.GetLatestResults()
+	if err != nil {
+		log.Printf("[dashboard] load results failed: %v", err)
+	}
 
 	// Group results by provider
 	provResults := make(map[int64][]store.CheckResultRow)
@@ -892,7 +921,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	// Build pinned/note lookup from in-memory providers
 	provMeta := make(map[string]provider.Provider)
-	for _, p := range s.providers {
+	for _, p := range s.providersSnapshot() {
 		provMeta[p.Name] = p
 	}
 
@@ -979,31 +1008,17 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	data := s.basePageData("模型视图")
 
-	latestResults, _ := s.store.GetLatestResults()
-	dbProviders, _ := s.store.GetProviders()
+	latestResults, err := s.store.GetLatestResults()
+	if err != nil {
+		log.Printf("[models] load results failed: %v", err)
+	}
 	allCaps, _ := s.store.GetAllCapabilities()
 
 	// Build fingerprint lookup: (providerName, model) → FingerprintRow
 	fpRows, _ := s.store.GetLatestFingerprints()
 	fpByKey := make(map[[2]string]store.FingerprintRow, len(fpRows))
-	fpCountByProvider := make(map[string]int, len(fpRows))
 	for _, f := range fpRows {
 		fpByKey[[2]string{f.ProviderName, f.Model}] = f
-		fpCountByProvider[f.ProviderName]++
-	}
-
-	// Build provider lookup: id -> (name, baseURL)
-	provInfo := make(map[int64][2]string) // [name, baseURL]
-	provIDByName := make(map[string]int64)
-	for _, dp := range dbProviders {
-		provInfo[dp.ID] = [2]string{dp.Name, dp.BaseURL}
-		provIDByName[dp.Name] = dp.ID
-	}
-	provBaseURL := make(map[string]string)
-	provAPIKey := make(map[string]string)
-	for _, p := range s.providers {
-		provBaseURL[p.Name] = p.BaseURL
-		provAPIKey[p.Name] = p.APIKey
 	}
 
 	// Group results by model
@@ -1011,12 +1026,8 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	type provResult struct {
 		providerID   int64
 		providerName string
-		baseURL      string
-		apiKey       string
 		latencyMs    int64
 		correct      bool
-		status       string
-		errorMsg     string
 		checkedAt    time.Time
 	}
 	grouped := make(map[modelKey][]provResult)
@@ -1027,32 +1038,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if _, exists := grouped[k]; !exists {
 			order = append(order, k)
 		}
-		info := provInfo[cr.ProviderID]
-		baseURL := info[1]
-		if u, ok := provBaseURL[info[0]]; ok {
-			baseURL = u
-		}
 		grouped[k] = append(grouped[k], provResult{
 			providerID:   cr.ProviderID,
-			providerName: info[0],
-			baseURL:      baseURL,
-			apiKey:       provAPIKey[info[0]],
+			providerName: cr.ProviderName,
 			latencyMs:    cr.LatencyMs,
 			correct:      cr.Correct,
-			status:       cr.Status,
-			errorMsg:     cr.ErrorMsg,
 			checkedAt:    cr.CheckedAt,
 		})
-	}
-
-	boolStr := func(b *bool) string {
-		if b == nil {
-			return ""
-		}
-		if *b {
-			return "true"
-		}
-		return "false"
 	}
 
 	vendorSet := make(map[string]bool)
@@ -1087,57 +1079,22 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, pr := range results {
-			row := ModelProviderRow{
-				ProviderName: pr.providerName,
-				BaseURL:      pr.baseURL,
-				APIKey:       pr.apiKey,
-				Model:        k.model,
-				LatencyMs:    pr.latencyMs,
-				Correct:      pr.correct,
-				IsBest:       pr.providerName == mg.BestProvider,
-				Status:       pr.status,
-				ErrorMsg:     pr.errorMsg,
-				CheckedAt:    pr.checkedAt,
-			}
-			// Fill capabilities from DB
+			// Only compute fields needed by the summary row. Provider details are
+			// rendered on demand by handleModelProviders so this page stays small.
 			if caps, ok := allCaps[pr.providerID]; ok {
 				if cap, ok := caps[k.model]; ok {
-					row.ToolUse = boolStr(cap.ToolUse)
-					row.Streaming = boolStr(cap.Streaming)
 					if cap.ToolUse != nil && *cap.ToolUse && cap.Streaming != nil && *cap.Streaming && isClaudeModel(k.model) {
-						row.CCCompat = true
 						anyCC = true
 					}
 				}
 			}
-			// Fill fingerprint verdict
 			if fp, ok := fpByKey[[2]string{pr.providerName, k.model}]; ok {
-				row.Verdict = fp.Verdict
-				row.FPScore = fp.TotalScore
-				row.FPState = "exact"
-				switch {
-				case fp.Verdict == "GENUINE":
-					row.VerdictClass = "genuine"
-				case fp.Verdict == "PLAUSIBLE":
-					row.VerdictClass = "plausible"
-				case strings.Contains(fp.Verdict, "SUSPECTED") || strings.Contains(fp.Verdict, "MISMATCH"):
-					row.VerdictClass = "suspected"
-				default:
-					row.VerdictClass = "fake"
+				if fp.TotalScore > mg.BestFPScore {
+					mg.BestFPScore = fp.TotalScore
 				}
-			} else if fpCountByProvider[pr.providerName] > 0 {
-				row.FPState = "sampled"
-			} else {
-				row.FPState = "none"
 			}
-			mg.Providers = append(mg.Providers, row)
 		}
 		mg.CCCompat = anyCC
-		for _, pr := range mg.Providers {
-			if pr.FPScore > mg.BestFPScore {
-				mg.BestFPScore = pr.FPScore
-			}
-		}
 
 		data.ModelGroups = append(data.ModelGroups, mg)
 	}
@@ -1159,6 +1116,102 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "models.html", data)
 }
 
+func (s *Server) handleModelProviders(w http.ResponseWriter, r *http.Request) {
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	if model == "" || len(model) > 512 {
+		http.Error(w, "invalid model", http.StatusBadRequest)
+		return
+	}
+
+	latestResults, err := s.store.GetResultsByModel(model)
+	if err != nil {
+		http.Error(w, "failed to load model results", http.StatusInternalServerError)
+		return
+	}
+	allCaps, _ := s.store.GetAllCapabilities()
+	fpRows, _ := s.store.GetLatestFingerprints()
+	fpByProvider := make(map[string]store.FingerprintRow)
+	fpCountByProvider := make(map[string]int)
+	for _, fp := range fpRows {
+		fpCountByProvider[fp.ProviderName]++
+		if fp.Model == model {
+			fpByProvider[fp.ProviderName] = fp
+		}
+	}
+
+	var bestProvider string
+	var bestLatency int64
+	for _, cr := range latestResults {
+		if !cr.Correct {
+			continue
+		}
+		if !cr.CheckedAt.IsZero() && time.Since(cr.CheckedAt) > 48*time.Hour {
+			continue
+		}
+		if bestLatency == 0 || cr.LatencyMs < bestLatency {
+			bestProvider = cr.ProviderName
+			bestLatency = cr.LatencyMs
+		}
+	}
+
+	boolStr := func(b *bool) string {
+		if b == nil {
+			return ""
+		}
+		if *b {
+			return "true"
+		}
+		return "false"
+	}
+
+	var rows []ModelProviderRow
+	for _, cr := range latestResults {
+		row := ModelProviderRow{
+			ProviderName: cr.ProviderName,
+			Model:        cr.Model,
+			LatencyMs:    cr.LatencyMs,
+			Correct:      cr.Correct,
+			IsBest:       cr.ProviderName == bestProvider,
+			Status:       cr.Status,
+			ErrorMsg:     cr.ErrorMsg,
+			CheckedAt:    cr.CheckedAt,
+		}
+		if caps, ok := allCaps[cr.ProviderID]; ok {
+			if cap, ok := caps[model]; ok {
+				row.ToolUse = boolStr(cap.ToolUse)
+				row.Streaming = boolStr(cap.Streaming)
+				row.CCCompat = cap.ToolUse != nil && *cap.ToolUse && cap.Streaming != nil && *cap.Streaming && isClaudeModel(model)
+			}
+		}
+		if fp, ok := fpByProvider[cr.ProviderName]; ok {
+			row.Verdict = fp.Verdict
+			row.FPScore = fp.TotalScore
+			row.FPState = "exact"
+			switch {
+			case fp.Verdict == "GENUINE":
+				row.VerdictClass = "genuine"
+			case fp.Verdict == "PLAUSIBLE":
+				row.VerdictClass = "plausible"
+			case strings.Contains(fp.Verdict, "SUSPECTED") || strings.Contains(fp.Verdict, "MISMATCH"):
+				row.VerdictClass = "suspected"
+			default:
+				row.VerdictClass = "fake"
+			}
+		} else if fpCountByProvider[cr.ProviderName] > 0 {
+			row.FPState = "sampled"
+		} else {
+			row.FPState = "none"
+		}
+		rows = append(rows, row)
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := s.tmpls["fragments"].ExecuteTemplate(w, "model_provider_rows.html", rows); err != nil {
+		log.Printf("template model_provider_rows.html: %v", err)
+	}
+}
+
 func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	dp, err := s.store.GetProviderByName(name)
@@ -1170,17 +1223,24 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 	data := s.basePageData(dp.Name)
 	provMeta := s.findProvider(dp.Name)
 	data.Provider = &struct {
-		Name        string
-		Status      string
-		Health      int
-		URL         string
-		Pinned      bool
-		Note        string
-		APIKey      string
-		AccessToken string
-		Priority    float64
-		Disabled    bool
-		RoutePaused bool
+		Name             string
+		Status           string
+		Health           int
+		URL              string
+		Pinned           bool
+		Note             string
+		APIKey           string
+		AccessToken      string
+		APIFormat        string
+		ClientMode       string
+		CodexUA          string
+		CodexOriginator  string
+		ClaudeCodeUA     string
+		AnthropicVersion string
+		AnthropicBeta    string
+		Priority         float64
+		Disabled         bool
+		RoutePaused      bool
 	}{
 		Name:   dp.Name,
 		Status: dp.Status,
@@ -1192,6 +1252,13 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		data.Provider.Note = provMeta.Note
 		data.Provider.APIKey = provMeta.APIKey
 		data.Provider.AccessToken = provMeta.AccessToken
+		data.Provider.APIFormat = provMeta.APIFormat
+		data.Provider.ClientMode = provider.NormalizeClientMode(provMeta.ClientMode)
+		data.Provider.CodexUA = provMeta.CodexUserAgent
+		data.Provider.CodexOriginator = provMeta.CodexOriginator
+		data.Provider.ClaudeCodeUA = provMeta.ClaudeCodeUserAgent
+		data.Provider.AnthropicVersion = provMeta.AnthropicVersion
+		data.Provider.AnthropicBeta = provMeta.AnthropicBeta
 		data.Provider.Priority = provMeta.Priority
 		data.Provider.Disabled = provMeta.Disabled
 		data.Provider.RoutePaused = provMeta.RoutePaused
@@ -1204,40 +1271,14 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		resultMap[cr.Model] = cr
 	}
 
-	// Get capabilities
-	caps, _ := s.store.GetCapabilities(dp.ID)
-	capMap := make(map[string]store.CapabilityRow)
-	for _, c := range caps {
-		capMap[c.Model] = c
+	// Page loads must never depend on an external relay. The explicit check
+	// button refreshes this snapshot; until then, show the last stored result.
+	allModels := make([]string, 0, len(storedResults))
+	for _, cr := range storedResults {
+		allModels = append(allModels, cr.Model)
 	}
 
-	// Live-fetch full model list from the provider
-	prov := s.findProvider(name)
-	var allModels []string
-	if prov != nil {
-		// Bound the live fetch so a slow/dead upstream can't hang this page-load
-		// handler for FetchModels' full 25s-with-retries ceiling. On timeout we
-		// fall back to the stored model list below.
-		fetchCtx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		fetched, fetchErr := s.engine.FetchModels(fetchCtx, prov.BaseURL, prov.APIKey)
-		cancel()
-		if fetchErr == nil {
-			for _, m := range fetched {
-				if !provider.ShouldSkip(m) {
-					allModels = append(allModels, m)
-				}
-			}
-		}
-	}
-
-	// If live fetch failed or empty, fall back to stored results
-	if len(allModels) == 0 {
-		for _, cr := range storedResults {
-			allModels = append(allModels, cr.Model)
-		}
-	}
-
-	// Build model rows: merge live list with stored results
+	// Build model rows from the current stored snapshot.
 	seen := make(map[string]bool)
 	for _, m := range allModels {
 		if seen[m] {
@@ -1287,7 +1328,7 @@ func (s *Server) handleTriggerCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go s.RunCheckAndStore(context.Background(), s.providers, "manual", mode)
+	go s.RunCheckAndStore(context.Background(), s.providersSnapshot(), "manual", mode)
 
 	w.WriteHeader(http.StatusAccepted)
 	label := "全量"
@@ -1301,16 +1342,37 @@ func (s *Server) handleTriggerSingleCheck(w http.ResponseWriter, r *http.Request
 	name := r.PathValue("name")
 
 	var target *provider.Provider
+	s.mu.Lock()
 	for i := range s.providers {
 		if strings.EqualFold(s.providers[i].Name, name) {
-			target = &s.providers[i]
+			p := s.providers[i]
+			target = &p
 			break
 		}
 	}
+	s.mu.Unlock()
 	if target == nil {
 		http.Error(w, `{"error":"provider not found"}`, http.StatusNotFound)
 		return
 	}
+
+	// Claim the check flag so a manual single-provider check can't run
+	// concurrently with a full/scheduled check — both write this provider's
+	// current_results and rebuild the routing table.
+	s.mu.Lock()
+	if s.isChecking {
+		s.mu.Unlock()
+		http.Error(w, `{"error":"check already running"}`, http.StatusConflict)
+		return
+	}
+	s.isChecking = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.isChecking = false
+		s.lastCheck = time.Now()
+		s.mu.Unlock()
+	}()
 
 	// Run synchronously — single provider is fast enough
 	pid, err := s.store.UpsertProvider(target.Name, target.BaseURL, target.APIFormat, target.Platform)
@@ -1352,7 +1414,7 @@ func (s *Server) handleTriggerSingleCheck(w http.ResponseWriter, r *http.Request
 	runFinished = true
 	s.refreshProviderMetadataAndCapabilities(r.Context(), *target, pid, pr.Results)
 	if s.proxy != nil {
-		s.rebuildProxyTable(s.providers)
+		s.rebuildProxyTable(s.providersSnapshot())
 		log.Printf("[proxy] routing table rebuilt after manual check: %d models", len(s.proxy.Table().Models()))
 	}
 
@@ -1375,6 +1437,28 @@ func (s *Server) handleGetProviders(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(providers)
+}
+
+func (s *Server) handleGetProviderConfig(w http.ResponseWriter, r *http.Request) {
+	prov := s.findProvider(r.PathValue("name"))
+	if prov == nil {
+		http.Error(w, `{"error":"provider not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// This endpoint intentionally returns a credential for the selected provider
+	// so the UI can build CLI snippets. Never cache it or embed every key in the
+	// models page as the old implementation did.
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	json.NewEncoder(w).Encode(struct {
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+	}{
+		BaseURL: prov.BaseURL,
+		APIKey:  prov.APIKey,
+	})
 }
 
 func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
@@ -1447,7 +1531,7 @@ func (s *Server) handleTriggerFingerprint(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	go s.RunFingerprintAndStore(context.Background(), s.providers)
+	go s.RunFingerprintAndStore(context.Background(), s.providersSnapshot())
 
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte(`{"status":"fingerprint started"}`))
@@ -1458,6 +1542,7 @@ func (s *Server) RunFingerprintAndStore(ctx context.Context, provs []provider.Pr
 	s.mu.Lock()
 	if s.isChecking {
 		s.mu.Unlock()
+		log.Printf("[fingerprint] run skipped: another check is already running")
 		return
 	}
 	s.isChecking = true
@@ -1528,7 +1613,7 @@ func (s *Server) RunFingerprintAndStore(ctx context.Context, provs []provider.Pr
 
 	// Rebuild proxy routing table with updated fingerprint scores
 	if s.proxy != nil {
-		s.rebuildProxyTable(s.providers)
+		s.rebuildProxyTable(s.providersSnapshot())
 		log.Printf("[proxy] routing table rebuilt with fingerprint data: %d models", len(s.proxy.Table().Models()))
 	}
 }
@@ -1569,12 +1654,29 @@ func modelSortRank(m ModelRow) int {
 }
 
 func (s *Server) findProvider(name string) *provider.Provider {
+	// Returns a copy under lock. Callers must not assume the returned pointer
+	// aliases the live slice element — mutating providers goes through the
+	// handlers, which hold s.mu.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for i := range s.providers {
 		if s.providers[i].Name == name {
-			return &s.providers[i]
+			p := s.providers[i]
+			return &p
 		}
 	}
 	return nil
+}
+
+// providersSnapshot returns a copy of the in-memory provider list under lock,
+// so read paths (dashboard, checks handed to background goroutines) never race
+// with the mutating handlers.
+func (s *Server) providersSnapshot() []provider.Provider {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]provider.Provider, len(s.providers))
+	copy(out, s.providers)
+	return out
 }
 
 func (s *Server) render(w http.ResponseWriter, name string, data pageData) {
@@ -1602,6 +1704,12 @@ func (s *Server) handleAddProvider(w http.ResponseWriter, r *http.Request) {
 	apiKey := r.FormValue("api_key")
 	accessToken := r.FormValue("access_token")
 	apiFormat := r.FormValue("api_format")
+	clientMode := r.FormValue("client_mode")
+	codexUA := r.FormValue("codex_user_agent")
+	codexOriginator := r.FormValue("codex_originator")
+	claudeCodeUA := r.FormValue("claude_code_user_agent")
+	anthropicVersion := r.FormValue("anthropic_version")
+	anthropicBeta := r.FormValue("anthropic_beta")
 
 	if name == "" || baseURL == "" || apiKey == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1620,31 +1728,65 @@ func (s *Server) handleAddProvider(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<div class="result-error">URL 格式无效，需以 http:// 或 https:// 开头</div>`)
 		return
 	}
-
-	// Check for duplicate name or hostname
-	for _, p := range s.providers {
-		if p.Name == name {
-			w.WriteHeader(http.StatusConflict)
-			fmt.Fprintf(w, `<div class="result-error">站名 "%s" 已存在</div>`, html.EscapeString(name))
-			return
-		}
-		if config.SameHost(p.BaseURL, baseURL) {
-			w.WriteHeader(http.StatusConflict)
-			fmt.Fprintf(w, `<div class="result-error">与已有站点 "%s" 重复（相同域名）</div>`, html.EscapeString(p.Name))
+	if apiFormat != "" && apiFormat != "chat" && apiFormat != "responses" {
+		http.Error(w, "invalid api_format", http.StatusBadRequest)
+		return
+	}
+	if !provider.ValidClientMode(clientMode) {
+		http.Error(w, "invalid client_mode", http.StatusBadRequest)
+		return
+	}
+	clientMode = provider.NormalizeClientMode(clientMode)
+	for _, value := range []string{codexUA, codexOriginator, claudeCodeUA, anthropicVersion, anthropicBeta} {
+		if !isValidHeaderOverride(value) {
+			http.Error(w, "invalid client profile header override", http.StatusBadRequest)
 			return
 		}
 	}
 
+	// Duplicate name/hostname check. Fast pre-check on a snapshot so the caller
+	// fails before the slow connectivity probe; the authoritative re-check runs
+	// under the lock at append time, closing the TOCTOU window that FetchModels
+	// opens between check and insert.
+	dupError := func(list []provider.Provider) string {
+		for _, p := range list {
+			if p.Name == name {
+				return fmt.Sprintf(`<div class="result-error">站名 "%s" 已存在</div>`, html.EscapeString(name))
+			}
+			if config.SameHost(p.BaseURL, baseURL) {
+				return fmt.Sprintf(`<div class="result-error">与已有站点 "%s" 重复（相同域名）</div>`, html.EscapeString(p.Name))
+			}
+		}
+		return ""
+	}
+	if msg := dupError(s.providersSnapshot()); msg != "" {
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, msg)
+		return
+	}
+
 	// Validate connectivity
-	_, err := s.engine.FetchModels(r.Context(), baseURL, apiKey)
+	profile := clientprofile.Config{
+		Mode: clientMode, CodexUserAgent: codexUA, CodexOriginator: codexOriginator, ClaudeCodeUserAgent: claudeCodeUA,
+		AnthropicVersion: anthropicVersion, AnthropicBeta: anthropicBeta,
+	}
+	_, err := s.engine.FetchModels(r.Context(), baseURL, apiKey, profile)
 
 	// Add to providers.json
 	newProv := provider.Provider{
 		Name: name, BaseURL: baseURL, APIKey: apiKey,
-		AccessToken: accessToken, APIFormat: apiFormat,
+		AccessToken: accessToken, APIFormat: apiFormat, ClientMode: clientMode,
+		CodexUserAgent: codexUA, CodexOriginator: codexOriginator, ClaudeCodeUserAgent: claudeCodeUA,
+		AnthropicVersion: anthropicVersion, AnthropicBeta: anthropicBeta,
 	}
 
 	s.mu.Lock()
+	if msg := dupError(s.providers); msg != "" {
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, msg)
+		return
+	}
 	s.providers = append(s.providers, newProv)
 	provs := make([]provider.Provider, len(s.providers))
 	copy(provs, s.providers)
@@ -1780,8 +1922,24 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 	baseURL := r.FormValue("base_url")
 	apiKey := r.FormValue("api_key")
 	accessToken := r.FormValue("access_token")
+	_, accessTokenProvided := r.Form["access_token"]
+	apiFormat := r.FormValue("api_format")
+	clientMode := r.FormValue("client_mode")
+	_, clientModeProvided := r.Form["client_mode"]
+	codexUA := r.FormValue("codex_user_agent")
+	_, codexUAProvided := r.Form["codex_user_agent"]
+	codexOriginator := r.FormValue("codex_originator")
+	_, codexOriginatorProvided := r.Form["codex_originator"]
+	claudeCodeUA := r.FormValue("claude_code_user_agent")
+	_, claudeCodeUAProvided := r.Form["claude_code_user_agent"]
+	anthropicVersion := r.FormValue("anthropic_version")
+	_, anthropicVersionProvided := r.Form["anthropic_version"]
+	anthropicBeta := r.FormValue("anthropic_beta")
+	_, anthropicBetaProvided := r.Form["anthropic_beta"]
 	note := r.FormValue("note")
+	_, noteProvided := r.Form["note"]
 	priorityStr := r.FormValue("priority")
+	_, priorityProvided := r.Form["priority"]
 
 	var priority float64
 	if priorityStr != "" {
@@ -1798,6 +1956,23 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if apiFormat != "" && apiFormat != "chat" && apiFormat != "responses" {
+		http.Error(w, "invalid api_format", http.StatusBadRequest)
+		return
+	}
+	if clientModeProvided && !provider.ValidClientMode(clientMode) {
+		http.Error(w, "invalid client_mode", http.StatusBadRequest)
+		return
+	}
+	if clientModeProvided {
+		clientMode = provider.NormalizeClientMode(clientMode)
+	}
+	for _, value := range []string{codexUA, codexOriginator, claudeCodeUA, anthropicVersion, anthropicBeta} {
+		if !isValidHeaderOverride(value) {
+			http.Error(w, "invalid client profile header override", http.StatusBadRequest)
+			return
+		}
+	}
 
 	// Hold lock across both DB and in-memory updates to avoid TOCTOU
 	s.mu.Lock()
@@ -1807,8 +1982,16 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 			s.store.RenameProvider(dp.ID, newName)
 			effectiveName = newName
 		}
-		if baseURL != "" {
-			s.store.UpsertProvider(effectiveName, baseURL, dp.APIFormat, dp.Platform)
+		if baseURL != "" || apiFormat != "" {
+			effectiveURL := dp.BaseURL
+			if baseURL != "" {
+				effectiveURL = baseURL
+			}
+			effectiveFormat := dp.APIFormat
+			if apiFormat != "" {
+				effectiveFormat = apiFormat
+			}
+			s.store.UpsertProvider(effectiveName, effectiveURL, effectiveFormat, dp.Platform)
 		}
 	}
 	for i, p := range s.providers {
@@ -1822,9 +2005,39 @@ func (s *Server) handleEditProvider(w http.ResponseWriter, r *http.Request) {
 			if apiKey != "" {
 				s.providers[i].APIKey = apiKey
 			}
-			s.providers[i].AccessToken = accessToken
-			s.providers[i].Note = note
-			s.providers[i].Priority = priority
+			if apiFormat != "" {
+				s.providers[i].APIFormat = apiFormat
+			}
+			if clientModeProvided {
+				s.providers[i].ClientMode = clientMode
+			}
+			// Presence-gated fields: a partial form (missing input) must not wipe
+			// existing values. Submitting the field with an empty value still
+			// clears it intentionally.
+			if codexUAProvided {
+				s.providers[i].CodexUserAgent = codexUA
+			}
+			if codexOriginatorProvided {
+				s.providers[i].CodexOriginator = codexOriginator
+			}
+			if claudeCodeUAProvided {
+				s.providers[i].ClaudeCodeUserAgent = claudeCodeUA
+			}
+			if anthropicVersionProvided {
+				s.providers[i].AnthropicVersion = anthropicVersion
+			}
+			if anthropicBetaProvided {
+				s.providers[i].AnthropicBeta = anthropicBeta
+			}
+			if accessTokenProvided {
+				s.providers[i].AccessToken = accessToken
+			}
+			if noteProvided {
+				s.providers[i].Note = note
+			}
+			if priorityProvided {
+				s.providers[i].Priority = priority
+			}
 			break
 		}
 	}

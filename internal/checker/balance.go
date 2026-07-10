@@ -37,7 +37,7 @@ func DetectPlatform(ctx context.Context, client *http.Client, baseURL string) st
 		req.Header.Set("User-Agent", UserAgent)
 		resp, err := client.Do(req)
 		if err == nil {
-			body, _ := io.ReadAll(resp.Body)
+			body, _, _ := readLimited(resp.Body)
 			resp.Body.Close()
 
 			bodyStr := strings.ToLower(string(body))
@@ -115,9 +115,12 @@ func queryBalanceUserSelf(ctx context.Context, client *http.Client, root, access
 		return nil, nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, tooLarge, err := readLimited(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if tooLarge {
+		return nil, errBodyTooLarge
 	}
 
 	var result struct {

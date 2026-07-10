@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"relay-monitor/internal/clientprofile"
 	"relay-monitor/internal/responsefmt"
 )
 
@@ -25,26 +26,34 @@ type ResponsesCapabilities struct {
 }
 
 // ProbeToolUse tests if a model supports function calling / tool use.
-func ProbeToolUse(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, apiFormat string) *bool {
-	if apiFormat == "responses" {
-		return probeResponsesToolUse(ctx, client, baseURL, apiKey, modelID)
+func ProbeToolUse(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, apiFormat string, profile clientprofile.Config) *bool {
+	mode := profile.ModeFor(modelID)
+	if mode == clientprofile.ModeClaudeCode {
+		return probeAnthropicToolUse(ctx, client, baseURL, apiKey, modelID, profile.WithMode(mode))
 	}
-	return probeChatToolUse(ctx, client, baseURL, apiKey, modelID)
+	if mode == clientprofile.ModeCodex || apiFormat == "responses" {
+		return probeResponsesToolUse(ctx, client, baseURL, apiKey, modelID, profile.WithMode(mode))
+	}
+	return probeChatToolUse(ctx, client, baseURL, apiKey, modelID, profile.WithMode(mode))
 }
 
 // ProbeStreaming tests if a model supports streaming responses.
-func ProbeStreaming(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, apiFormat string) *bool {
-	if apiFormat == "responses" {
-		return probeResponsesStreaming(ctx, client, baseURL, apiKey, modelID)
+func ProbeStreaming(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, apiFormat string, profile clientprofile.Config) *bool {
+	mode := profile.ModeFor(modelID)
+	if mode == clientprofile.ModeClaudeCode {
+		return probeAnthropicStreaming(ctx, client, baseURL, apiKey, modelID, profile.WithMode(mode))
 	}
-	return probeChatStreaming(ctx, client, baseURL, apiKey, modelID)
+	if mode == clientprofile.ModeCodex || apiFormat == "responses" {
+		return probeResponsesStreaming(ctx, client, baseURL, apiKey, modelID, profile.WithMode(mode))
+	}
+	return probeChatStreaming(ctx, client, baseURL, apiKey, modelID, profile.WithMode(mode))
 }
 
 // ProbeCapabilities tests both tool_use and streaming for a chat-format model.
-func ProbeCapabilities(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, apiFormat string) CapabilityProbe {
-	streaming := ProbeStreaming(ctx, client, baseURL, apiKey, modelID, apiFormat)
+func ProbeCapabilities(ctx context.Context, client *http.Client, baseURL, apiKey, modelID, apiFormat string, profile clientprofile.Config) CapabilityProbe {
+	streaming := ProbeStreaming(ctx, client, baseURL, apiKey, modelID, apiFormat, profile)
 	time.Sleep(time.Second) // Brief pause between probes
-	toolUse := ProbeToolUse(ctx, client, baseURL, apiKey, modelID, apiFormat)
+	toolUse := ProbeToolUse(ctx, client, baseURL, apiKey, modelID, apiFormat, profile)
 	return CapabilityProbe{
 		ToolUse:   toolUse,
 		Streaming: streaming,
@@ -52,16 +61,18 @@ func ProbeCapabilities(ctx context.Context, client *http.Client, baseURL, apiKey
 }
 
 // ProbeResponsesCapabilities probes /responses support more precisely than a single boolean.
-func ProbeResponsesCapabilities(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string) ResponsesCapabilities {
-	basic := probeResponsesBasic(ctx, client, baseURL, apiKey, modelID)
+func ProbeResponsesCapabilities(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string, profile clientprofile.Config) ResponsesCapabilities {
+	mode := profile.ModeFor(modelID)
+	profile = profile.WithMode(mode)
+	basic := probeResponsesBasic(ctx, client, baseURL, apiKey, modelID, profile)
 	if basic == nil || !*basic {
 		return ResponsesCapabilities{Basic: basic}
 	}
 
 	time.Sleep(time.Second)
-	streaming := probeResponsesStreaming(ctx, client, baseURL, apiKey, modelID)
+	streaming := probeResponsesStreaming(ctx, client, baseURL, apiKey, modelID, profile)
 	time.Sleep(time.Second)
-	toolUse := probeResponsesToolUse(ctx, client, baseURL, apiKey, modelID)
+	toolUse := probeResponsesToolUse(ctx, client, baseURL, apiKey, modelID, profile)
 
 	return ResponsesCapabilities{
 		Basic:     basic,
@@ -70,7 +81,7 @@ func ProbeResponsesCapabilities(ctx context.Context, client *http.Client, baseUR
 	}
 }
 
-func probeChatToolUse(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string) *bool {
+func probeChatToolUse(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string, profile clientprofile.Config) *bool {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -96,7 +107,6 @@ func probeChatToolUse(ctx context.Context, client *http.Client, baseURL, apiKey,
 		},
 		"tool_choice": "required",
 		"max_tokens":  200,
-		"temperature": 0,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
@@ -105,7 +115,7 @@ func probeChatToolUse(ctx context.Context, client *http.Client, baseURL, apiKey,
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	profile.ApplyHeaders(req, modelID)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -117,8 +127,8 @@ func probeChatToolUse(ctx context.Context, client *http.Client, baseURL, apiKey,
 		return classifyCapabilityStatus(resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	body, tooLarge, err := readLimited(resp.Body)
+	if err != nil || tooLarge {
 		return nil
 	}
 
@@ -141,17 +151,16 @@ func probeChatToolUse(ctx context.Context, client *http.Client, baseURL, apiKey,
 	return boolPtr(ok && len(calls) > 0)
 }
 
-func probeChatStreaming(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string) *bool {
+func probeChatStreaming(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string, profile clientprofile.Config) *bool {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
 	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
 	payload, _ := json.Marshal(map[string]any{
-		"model":       modelID,
-		"messages":    []map[string]string{{"role": "user", "content": "Say hello"}},
-		"stream":      true,
-		"max_tokens":  50,
-		"temperature": 0,
+		"model":      modelID,
+		"messages":   []map[string]string{{"role": "user", "content": "Say hello"}},
+		"stream":     true,
+		"max_tokens": 50,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
@@ -160,7 +169,7 @@ func probeChatStreaming(ctx context.Context, client *http.Client, baseURL, apiKe
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	profile.ApplyHeaders(req, modelID)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -198,15 +207,15 @@ func probeChatStreaming(ctx context.Context, client *http.Client, baseURL, apiKe
 	return boolPtr(len(firstPayload) > 0)
 }
 
-func probeResponsesBasic(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string) *bool {
+func probeResponsesBasic(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string, profile clientprofile.Config) *bool {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	url := strings.TrimRight(baseURL, "/") + "/responses"
 	payload, _ := json.Marshal(map[string]any{
-		"model":       modelID,
-		"input":       "Say hello in one short sentence.",
-		"temperature": 0,
+		"model": modelID,
+		"input": "Say hello in one short sentence.",
+		"store": false,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
@@ -215,7 +224,7 @@ func probeResponsesBasic(ctx context.Context, client *http.Client, baseURL, apiK
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	profile.ApplyHeaders(req, modelID)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -227,8 +236,8 @@ func probeResponsesBasic(ctx context.Context, client *http.Client, baseURL, apiK
 		return classifyCapabilityStatus(resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	body, tooLarge, err := readLimited(resp.Body)
+	if err != nil || tooLarge {
 		return nil
 	}
 
@@ -239,7 +248,7 @@ func probeResponsesBasic(ctx context.Context, client *http.Client, baseURL, apiK
 	return boolPtr(facts.OutputItems > 0)
 }
 
-func probeResponsesToolUse(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string) *bool {
+func probeResponsesToolUse(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string, profile clientprofile.Config) *bool {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -271,7 +280,7 @@ func probeResponsesToolUse(ctx context.Context, client *http.Client, baseURL, ap
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	profile.ApplyHeaders(req, modelID)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -283,8 +292,8 @@ func probeResponsesToolUse(ctx context.Context, client *http.Client, baseURL, ap
 		return classifyCapabilityStatus(resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	body, tooLarge, err := readLimited(resp.Body)
+	if err != nil || tooLarge {
 		return nil
 	}
 
@@ -295,7 +304,7 @@ func probeResponsesToolUse(ctx context.Context, client *http.Client, baseURL, ap
 	return boolPtr(facts.HasFunctionCall)
 }
 
-func probeResponsesStreaming(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string) *bool {
+func probeResponsesStreaming(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string, profile clientprofile.Config) *bool {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -312,7 +321,7 @@ func probeResponsesStreaming(ctx context.Context, client *http.Client, baseURL, 
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	profile.ApplyHeaders(req, modelID)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -348,6 +357,113 @@ func probeResponsesStreaming(ctx context.Context, client *http.Client, baseURL, 
 		return boolPtr(false)
 	}
 	if _, err := responsefmt.ValidateStreamEvent(body); err != nil {
+		return boolPtr(false)
+	}
+	return boolPtr(true)
+}
+
+func probeAnthropicToolUse(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string, profile clientprofile.Config) *bool {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	url := strings.TrimRight(baseURL, "/") + "/messages"
+	payload, _ := json.Marshal(map[string]any{
+		"model":      modelID,
+		"max_tokens": 128,
+		"messages":   []map[string]string{{"role": "user", "content": "What is the weather in Beijing?"}},
+		"tools": []map[string]any{{
+			"name":        "get_weather",
+			"description": "Get weather for a city",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"city": map[string]string{"type": "string"}},
+				"required":   []string{"city"},
+			},
+		}},
+		"tool_choice": map[string]string{"type": "tool", "name": "get_weather"},
+	})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	profile.ApplyHeaders(req, modelID)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return classifyCapabilityStatus(resp.StatusCode)
+	}
+
+	body, tooLarge, err := readLimited(resp.Body)
+	if err != nil || tooLarge {
+		return nil
+	}
+	var result struct {
+		Content []struct {
+			Type string `json:"type"`
+		} `json:"content"`
+	}
+	if json.Unmarshal(body, &result) != nil {
+		return boolPtr(false)
+	}
+	for _, item := range result.Content {
+		if item.Type == "tool_use" {
+			return boolPtr(true)
+		}
+	}
+	return boolPtr(false)
+}
+
+func probeAnthropicStreaming(ctx context.Context, client *http.Client, baseURL, apiKey, modelID string, profile clientprofile.Config) *bool {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	url := strings.TrimRight(baseURL, "/") + "/messages"
+	payload, _ := json.Marshal(map[string]any{
+		"model":      modelID,
+		"max_tokens": 32,
+		"messages":   []map[string]string{{"role": "user", "content": "Say hello"}},
+		"stream":     true,
+	})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	profile.ApplyHeaders(req, modelID)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return classifyCapabilityStatus(resp.StatusCode)
+	}
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return boolPtr(false)
+	}
+
+	body, err := readFirstSSEPayload(resp.Body)
+	if err != nil {
+		if err == io.EOF {
+			return boolPtr(false)
+		}
+		return nil
+	}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(body, &event) != nil || event.Type == "" || event.Type == "error" {
 		return boolPtr(false)
 	}
 	return boolPtr(true)

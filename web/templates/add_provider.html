@@ -31,6 +31,23 @@
                 <label><input type="radio" name="api_format" value="responses"> Responses API <span class="text-dim">(仅纯 OpenAI 转发站)</span></label>
             </div>
         </div>
+        <div class="form-group">
+            <label>客户端模式 <span class="text-dim">(仅站点明确限制 CC/CX 时修改)</span></label>
+            <select name="client_mode">
+                <option value="generic" selected>普通 OpenAI 兼容</option>
+                <option value="codex">Codex CLI</option>
+                <option value="claude_code">Claude Code</option>
+                <option value="auto">CC/CX 自动（按模型切换协议）</option>
+            </select>
+        </div>
+        <details style="margin-bottom:8px">
+            <summary class="text-dim" style="cursor:pointer;font-size:0.82rem">CLI 身份覆盖（客户端升级或站点规则变化时才填）</summary>
+            <div class="form-group" style="margin-top:8px"><label>Codex User-Agent</label><input type="text" name="codex_user_agent" placeholder="留空使用内置默认值"></div>
+            <div class="form-group"><label>Codex Originator</label><input type="text" name="codex_originator" placeholder="留空使用内置默认值"></div>
+            <div class="form-group"><label>Claude Code User-Agent</label><input type="text" name="claude_code_user_agent" placeholder="留空使用内置默认值"></div>
+            <div class="form-group"><label>Anthropic Version</label><input type="text" name="anthropic_version" placeholder="留空使用内置默认值"></div>
+            <div class="form-group"><label>Anthropic Beta</label><input type="text" name="anthropic_beta" placeholder="留空使用内置默认值"></div>
+        </details>
     </details>
 
     <button type="submit" class="btn btn-primary">验证并添加</button>

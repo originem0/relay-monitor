@@ -1,0 +1,23 @@
+# Relay Monitor 配置
+# 复制为 config.toml 后填入实际值。config.toml 已被 .gitignore 忽略，
+# 不会进入版本控制（proxy.api_key 是凭据，切勿提交到公开仓库）。
+listen = "127.0.0.1:8090"          # 监听地址（仅本地，配合 nginx 反代）
+check_interval = "8h"              # 定时巡检间隔
+retention_days = 7                 # 历史/事件保留天数（<1 时回退默认值 7）
+max_concurrency = 16               # 并发检测站点数（<1 时回退默认值 16）
+request_interval = "2s"            # 站内模型间隔
+ssl_verify = true                  # SSL 证书验证（默认开启；仅在自签证书站点上关闭）
+data_dir = "./data"                # SQLite 数据目录
+balance_threshold = 5.0            # 余额告警阈值
+providers_file = "providers.json"  # 站点列表文件
+external_url = ""                  # 外网访问地址（Proxy 页面展示用）
+
+[proxy]
+enabled = true
+# 留空则启动时自动生成一个随机 key 并打印到日志（不落盘）。
+# 要固定 key，在此填入；请勿把真实 key 提交到公开仓库。
+api_key = ""
+request_timeout = "30s"            # 非流式请求超时
+stream_first_byte_timeout = "30s"  # 流式首字节超时（仅约束首字节，不限制整条流时长）
+stream_idle_timeout = "60s"        # 流式空闲超时（流中途静默超过此值判定断流）
+max_retries = 2                    # 单请求最多换站重试次数

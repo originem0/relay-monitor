@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"relay-monitor/internal/clientprofile"
 	"relay-monitor/internal/config"
 	"relay-monitor/internal/provider"
 	"relay-monitor/internal/responsefmt"
@@ -40,6 +41,10 @@ const (
 	// completion, but bounded so a malicious or broken upstream can't OOM the
 	// proxy by streaming an unbounded body into io.ReadAll.
 	maxResponsesRespBytes int64 = 32 * 1024 * 1024
+	// maxStreamBlockBytes caps how many bytes a single SSE event block may
+	// accumulate in pipeResponsesStream before the block boundary (blank line)
+	// arrives. Same OOM guard as above, for the streaming path.
+	maxStreamBlockBytes = 4 * 1024 * 1024
 )
 
 // New creates a Proxy with the given config. The routing table starts empty.
@@ -279,7 +284,7 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 		}
 
 		upstreamURL := strings.TrimRight(candidate.BaseURL, "/") + pathSuffix
-		outcome := p.forwardOne(r.Context(), retryCfg, upstreamURL, candidate.APIKey, body, req, apiFormat, w, r)
+		outcome := p.forwardOne(r.Context(), retryCfg, upstreamURL, candidate.APIKey, candidate.ClientProfile, body, req, apiFormat, w, r)
 		elapsed := time.Since(start).Milliseconds()
 
 		attemptEntry := Attempt{
@@ -320,11 +325,13 @@ func (p *Proxy) proxyRequest(w http.ResponseWriter, r *http.Request, apiFormat, 
 			default:
 				p.breakers.ReleaseProbe(candidate.ProviderID, req.Model)
 			}
-		} else if outcome.result == forwardRetry || outcome.failure == FailureModelGone {
-			// forwardRetry (5xx/429/timeout) trips the breaker as before; a persistent
-			// "model gone" (404) now trips it too, so a station that no longer serves
-			// this model stops being retried on every single request (cooldown + the
-			// half-open probe will re-admit it if the model comes back).
+		} else if outcome.result == forwardRetry || persistentFailure(outcome.failure) {
+			// forwardRetry (5xx/429/timeout) trips the breaker as before. Persistent
+			// failures (404 model gone, 401 revoked key, 403 exhausted quota) now trip
+			// it too: they don't heal between requests, and without breaker memory the
+			// provider re-earns primary traffic every time the stats window resets,
+			// burning one retry attempt per user request until the next 8h check.
+			// The cooldown + half-open probe re-admit it if the condition clears.
 			p.breakers.RecordFailure(candidate.ProviderID, req.Model)
 		}
 
@@ -411,19 +418,27 @@ type forwardOutcome struct {
 	failure    FailureClass // FailureNone on success
 }
 
-// fallbackUserAgent is the browser UA the proxy always presents to upstreams
-// (see forwardOne). It deliberately matches checker.UserAgent so any site the
-// checker probed as healthy stays reachable through the proxy — many relays gate
-// on User-Agent and reject non-browser clients like openclaw-rescue / curl.
-const fallbackUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, apiKey string, body []byte, reqMeta proxyRequestMeta, apiFormat string, w http.ResponseWriter, origReq *http.Request) forwardOutcome {
-	timeout := cfg.RequestTimeout.Duration
+func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, apiKey string, profile clientprofile.Config, body []byte, reqMeta proxyRequestMeta, apiFormat string, w http.ResponseWriter, origReq *http.Request) forwardOutcome {
+	// Streaming: the first-byte timeout bounds time-to-response-headers only.
+	// A deadline on the request context would also govern the body read and cut
+	// off any stream running longer than the timeout, so use a plain cancelable
+	// context armed by a timer that is disarmed once headers arrive; mid-stream
+	// health is the idle timeout's job. Non-streaming keeps the full-request
+	// deadline, which is the intended meaning of request_timeout.
+	var reqCtx context.Context
+	var cancel context.CancelFunc
+	var fbTimer *time.Timer
+	var firstByteTimedOut atomic.Bool
 	if reqMeta.Stream {
-		timeout = cfg.StreamFirstByteTimeout.Duration
+		reqCtx, cancel = context.WithCancel(ctx)
+		fbTimer = time.AfterFunc(cfg.StreamFirstByteTimeout.Duration, func() {
+			firstByteTimedOut.Store(true)
+			cancel()
+		})
+		defer fbTimer.Stop()
+	} else {
+		reqCtx, cancel = context.WithTimeout(ctx, cfg.RequestTimeout.Duration)
 	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	upstream, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
@@ -434,23 +449,22 @@ func (p *Proxy) forwardOne(ctx context.Context, cfg *config.ProxyConfig, url, ap
 	// Copy relevant headers from original request
 	upstream.Header.Set("Content-Type", "application/json")
 	upstream.Header.Set("Authorization", "Bearer "+apiKey)
-	// Always present a browser UA to the upstream — the same one the checker uses
-	// to probe it. Forwarding the downstream client's own UA (openclaw-rescue,
-	// curl, …) gets rejected by relays that gate on User-Agent (Cloudflare 1010,
-	// or a bogus 401 "invalid API key"), even though the checker saw the site
-	// healthy and routed it. Keeping proxy UA == checker UA makes a routable model
-	// actually callable through the proxy.
-	upstream.Header.Set("User-Agent", fallbackUserAgent)
+	// Use the same provider identity as the checker. Otherwise a CLI-restricted
+	// relay can pass health checks and still reject every routed request.
+	profile.ApplyHeaders(upstream, reqMeta.Model)
 	if accept := origReq.Header.Get("Accept"); accept != "" {
 		upstream.Header.Set("Accept", accept)
 	}
 
 	resp, err := p.client.Do(upstream)
+	if fbTimer != nil {
+		fbTimer.Stop() // headers arrived; the stream now lives under the idle timeout
+	}
 	if err != nil {
 		// Surface a timeout distinctly from other transport failures so the
 		// trace shows the real reason instead of a generic upstream error.
 		fc := FailureUpstream5xx
-		if errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.DeadlineExceeded) || firstByteTimedOut.Load() {
 			fc = FailureTimeout
 		}
 		log.Printf("[proxy] upstream connect error: %s: %v", url, err)
@@ -526,8 +540,12 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	idle := time.NewTimer(cfg.StreamIdleTimeout.Duration)
-	defer idle.Stop()
+	// Idle detection: the reader goroutine stamps lastActivity and this goroutine
+	// polls it. Calling Timer.Reset from the reader while this goroutine receives
+	// on the timer channel is the documented Timer race and yields spurious
+	// timeouts; a monotonic timestamp poll has no such window.
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
 
 	var timedOut atomic.Bool
 	type pipeResult struct {
@@ -542,6 +560,7 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 		sawFunctionCall := false
 		var blockLines []string
 		var dataLines []string
+		blockBytes := 0
 
 		writeHeaders := func() {
 			if started {
@@ -614,16 +633,31 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 
 		for scanner.Scan() {
 			line := scanner.Text()
-			idle.Reset(cfg.StreamIdleTimeout.Duration)
+			lastActivity.Store(time.Now().UnixNano())
 			if line == "" {
 				result, wrote, stop, fc := flushBlock()
 				blockLines = nil
 				dataLines = nil
+				blockBytes = 0
 				if stop {
 					done <- pipeResult{result: result, wrote: wrote, failure: fc}
 					return
 				}
 				continue
+			}
+
+			// Cap per-block accumulation: an upstream that never sends an event
+			// boundary (blank line) would otherwise grow blockLines without limit —
+			// the streaming twin of the maxResponsesRespBytes OOM guard.
+			blockBytes += len(line)
+			if blockBytes > maxStreamBlockBytes {
+				if !started {
+					done <- pipeResult{result: forwardRetry, wrote: false, failure: FailureProtocolError}
+					return
+				}
+				emitProtocolError("upstream SSE event exceeds size limit")
+				done <- pipeResult{result: forwardDone, wrote: true, failure: FailureProtocolError}
+				return
 			}
 
 			blockLines = append(blockLines, line)
@@ -660,15 +694,34 @@ func (p *Proxy) pipeResponsesStream(w http.ResponseWriter, resp *http.Response, 
 		done <- pipeResult{result: forwardOK, wrote: started, failure: FailureNone}
 	}()
 
-	select {
-	case result := <-done:
-		return result.result, result.wrote, result.failure
-	case <-idle.C:
-		timedOut.Store(true)
-		resp.Body.Close()
-		result := <-done
-		return result.result, result.wrote, result.failure
+	ticker := time.NewTicker(idlePollInterval(cfg.StreamIdleTimeout.Duration))
+	defer ticker.Stop()
+	for {
+		select {
+		case result := <-done:
+			return result.result, result.wrote, result.failure
+		case <-ticker.C:
+			if time.Since(time.Unix(0, lastActivity.Load())) > cfg.StreamIdleTimeout.Duration {
+				timedOut.Store(true)
+				resp.Body.Close()
+				result := <-done
+				return result.result, result.wrote, result.failure
+			}
+		}
 	}
+}
+
+// idlePollInterval picks how often the idle monitor samples lastActivity:
+// a quarter of the idle timeout, clamped to [10ms, 1s].
+func idlePollInterval(idleTimeout time.Duration) time.Duration {
+	interval := idleTimeout / 4
+	if interval > time.Second {
+		interval = time.Second
+	}
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	return interval
 }
 
 func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *config.ProxyConfig) (forwardResult, FailureClass) {
@@ -691,8 +744,10 @@ func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *conf
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	idle := time.NewTimer(cfg.StreamIdleTimeout.Duration)
-	defer idle.Stop()
+	// Same lastActivity-poll idle detection as pipeResponsesStream — see the
+	// Timer race note there.
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
 
 	var timedOut atomic.Bool
 	done := make(chan forwardResult, 1)
@@ -706,7 +761,7 @@ func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *conf
 			if line == "" { // SSE event boundary
 				flusher.Flush()
 			}
-			idle.Reset(cfg.StreamIdleTimeout.Duration)
+			lastActivity.Store(time.Now().UnixNano())
 			if strings.HasPrefix(line, "data: [DONE]") {
 				done <- forwardOK
 				return
@@ -726,18 +781,24 @@ func (p *Proxy) pipeStream(w http.ResponseWriter, resp *http.Response, cfg *conf
 		done <- forwardOK
 	}()
 
-	select {
-	case result := <-done:
-		fc := FailureNone
-		if result != forwardOK {
-			fc = FailureStreamBroken
+	ticker := time.NewTicker(idlePollInterval(cfg.StreamIdleTimeout.Duration))
+	defer ticker.Stop()
+	for {
+		select {
+		case result := <-done:
+			fc := FailureNone
+			if result != forwardOK {
+				fc = FailureStreamBroken
+			}
+			return result, fc
+		case <-ticker.C:
+			if time.Since(time.Unix(0, lastActivity.Load())) > cfg.StreamIdleTimeout.Duration {
+				// Upstream went silent mid-stream; signal timeout and close body to unblock scanner
+				timedOut.Store(true)
+				resp.Body.Close()
+				return <-done, FailureStreamIdle
+			}
 		}
-		return result, fc
-	case <-idle.C:
-		// Upstream went silent mid-stream; signal timeout and close body to unblock scanner
-		timedOut.Store(true)
-		resp.Body.Close()
-		return <-done, FailureStreamIdle
 	}
 }
 
